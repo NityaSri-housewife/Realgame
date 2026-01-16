@@ -1982,25 +1982,27 @@ def calculate_overall_bias(atm_bias, support_bias, resistance_bias, seller_bias_
 # -----------------------
 #  TELEGRAM FUNCTIONS
 # -----------------------
-def send_telegram_message(bot_token=None, chat_id=None, message=""):
+def send_telegram_message(bot_token, chat_id, message):
     """
-    Send message to Telegram using TelegramBot class (supports dual recipients)
-    bot_token and chat_id params kept for backward compatibility but ignored
+    Actually send message to Telegram
     """
     try:
-        from telegram_alerts import TelegramBot
-
-        bot = TelegramBot()
-        if not bot.enabled:
+        if not bot_token or not chat_id:
             return False, "Telegram credentials not configured"
-
-        # Send to all configured bots/recipients
-        success = bot.send_message(message, parse_mode="Markdown")
-
-        if success:
-            return True, "Signal sent to Telegram channel(s)!"
+        
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        
+        if response.status_code == 200:
+            return True, "Signal sent to Telegram channel!"
         else:
-            return False, "Failed to send message"
+            return False, f"Failed to send: {response.status_code}"
     except Exception as e:
         return False, f"Telegram error: {str(e)}"
 
