@@ -417,20 +417,16 @@ if 'overall_option_data' not in st.session_state:
 # ═══════════════════════════════════════════════════════════════════════
 # AUTO REFRESH & PERFORMANCE OPTIMIZATIONS
 # ═══════════════════════════════════════════════════════════════════════
-# Dynamic auto-refresh based on market session:
-# - Regular trading (9:15-3:30 PM): 10 seconds (real-time spot price)
-# - Pre-market (8:30-9:15 AM): 30 seconds
-# - Post-market (3:30-3:45 PM): 60 seconds
-# - Market closed: 300 seconds (5 minutes)
+# Optimized for fast loading and refresh:
+# - Chart data cached for 60 seconds
+# - Signal checks reduced to 30-second intervals
+# - Lazy loading for tab-specific data
+# - Streamlit caching for expensive computations
 
-# Get current market session to determine refresh interval
-current_session = scheduler.get_market_session()
-session_refresh_interval = scheduler.get_refresh_interval(current_session)
-
-# Auto-refresh with dynamic interval based on market hours
-# This ensures spot price updates every 10s during trading hours
-# limit=None ensures continuous refresh without stopping
-refresh_count = st_autorefresh(interval=session_refresh_interval * 1000, limit=None, key="data_refresh")
+# Auto-refresh every 1 minute (configurable via AUTO_REFRESH_INTERVAL)
+# This ensures the app stays updated with latest market data
+# The refresh is seamless - no blur/flash thanks to custom CSS above
+refresh_count = st_autorefresh(interval=AUTO_REFRESH_INTERVAL * 1000, key="data_refresh")
 
 # ═══════════════════════════════════════════════════════════════════════
 # HEADER
@@ -441,18 +437,6 @@ st.caption(APP_SUBTITLE)
 
 # Check and run AI analysis if needed
 check_and_run_ai_analysis()
-
-# ═══════════════════════════════════════════════════════════════════════
-# MARKET STATUS CACHE (Performance Optimization)
-# ═══════════════════════════════════════════════════════════════════════
-# Cache market status to avoid repeated calls (called 3+ times per refresh)
-@st.cache_data(ttl=10, show_spinner=False)  # Cache for 10 seconds
-def get_cached_market_status():
-    """Cached market status to avoid repeated calls"""
-    return get_market_status()
-
-# Get market status once and reuse throughout the page
-cached_market_status = get_cached_market_status()
 
 # ═══════════════════════════════════════════════════════════════════════
 # MARKET HOURS WARNING BANNER
@@ -475,11 +459,13 @@ if MARKET_HOURS_ENABLED:
         """)
 
         # Show next market open time if available
-        if 'next_open' in cached_market_status:
-            st.info(f"📅 **Next Market Open:** {cached_market_status['next_open']}")
+        market_status = get_market_status()
+        if 'next_open' in market_status:
+            st.info(f"📅 **Next Market Open:** {market_status['next_open']}")
     else:
         # Show market session info when market is open
-        session = cached_market_status.get('session', 'unknown')
+        market_status = get_market_status()
+        session = market_status.get('session', 'unknown')
 
         if session == 'pre_market':
             st.info(f"⏰ **{reason}** - Limited liquidity expected")
@@ -493,27 +479,22 @@ if MARKET_HOURS_ENABLED:
 
 with st.sidebar:
     st.header("⚙️ System Status")
-
-    # Market status (use cached version)
-    if cached_market_status['open']:
-        st.success(f"{cached_market_status['message']} | {cached_market_status['time']}")
+    
+    # Market status
+    market_status = get_market_status()
+    if market_status['open']:
+        st.success(f"{market_status['message']} | {market_status['time']}")
     else:
-        st.error(cached_market_status['message'])
+        st.error(market_status['message'])
     
     st.divider()
-
-    # DhanHQ connection (with caching to avoid API calls on every refresh)
+    
+    # DhanHQ connection
     st.subheader("🔌 DhanHQ API")
     if DEMO_MODE:
         st.info("🧪 DEMO MODE Active")
     else:
-        # Cache connection status for 5 minutes to avoid expensive API calls
-        @st.cache_data(ttl=300, show_spinner=False)  # 5 minutes cache
-        def get_cached_connection_status():
-            """Check Dhan connection with caching to prevent repeated API calls"""
-            return check_dhan_connection()
-
-        if get_cached_connection_status():
+        if check_dhan_connection():
             st.success("✅ Connected")
         else:
             st.error("❌ Connection Failed")
@@ -560,8 +541,7 @@ with st.sidebar:
     
     # Settings
     st.subheader("⚙️ Settings")
-    st.write(f"**Auto Refresh:** {session_refresh_interval}s (Dynamic)")
-    st.caption("10s during trading • 30s pre-market • 60s post-market • 300s closed")
+    st.write(f"**Auto Refresh:** {AUTO_REFRESH_INTERVAL}s")
     st.write(f"**NIFTY Lot Size:** {LOT_SIZES['NIFTY']}")
     st.write(f"**SENSEX Lot Size:** {LOT_SIZES['SENSEX']}")
     st.write(f"**SL Offset:** {STOP_LOSS_OFFSET} points")
@@ -736,9 +716,9 @@ if current_time - st.session_state.sentiment_cache_time > 120:
         st.session_state.sentiment_cache_time = current_time
 
 # ═══════════════════════════════════════════════════════════════════════
-# MARKET STATUS (use cached version from above)
+# MARKET STATUS
 # ═══════════════════════════════════════════════════════════════════════
-market_status = cached_market_status
+market_status = get_market_status()
 
 # Display market data - Use session state fallbacks from NIFTY Option Screener
 col1, col2, col3, col4 = st.columns(4)
@@ -4036,14 +4016,14 @@ with tab6:
         st.error(f"Error loading multi-timeframe analysis: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════
-# TAB 7: NIFTY OPTION SCREENER V7.0 (AUTO-LOAD)
+# TAB 7: NIFTY OPTION SCREENER V7.0 (AUTO-LOAD WITH SMART CACHING)
 # ═══════════════════════════════════════════════════════════════════════
 
 with tab7:
     st.header("🎯 NIFTY Option Screener v7.0")
     st.caption("100% SELLER'S PERSPECTIVE + ATM BIAS ANALYZER + MOMENT DETECTOR + EXPIRY SPIKE DETECTOR + ENHANCED OI/PCR ANALYTICS")
 
-    # Auto-load the Option Screener (no lazy loading - loads immediately)
+    # Auto-load the Option Screener
     try:
         from NiftyOptionScreener import render_nifty_option_screener
         render_nifty_option_screener()
@@ -4134,13 +4114,20 @@ with tab8:
 with tab9:
     st.markdown("# 🔍 NSE Stock Screener")
 
-    # Auto-load stock screener (no lazy loading)
-    try:
-        from nse_stock_screener_dhan import render_nse_stock_screener_tab
-        render_nse_stock_screener_tab()
-    except Exception as e:
-        st.error(f"❌ Error loading NSE Stock Screener: {e}")
-        st.info("Ensure nse_stock_screener_dhan.py exists and all dependencies are installed.")
+    # LAZY LOADING - Only load when user clicks button (performance fix)
+    if st.button("🔄 Load Stock Screener", type="primary", key="load_screener_btn"):
+        st.session_state.load_stock_screener = True
+
+    if st.session_state.get('load_stock_screener', False):
+        try:
+            with st.spinner("Loading stock screener..."):
+                from nse_stock_screener_dhan import render_nse_stock_screener_tab
+                render_nse_stock_screener_tab()
+        except Exception as e:
+            st.error(f"❌ Error loading NSE Stock Screener: {e}")
+            st.info("Ensure nse_stock_screener_dhan.py exists and all dependencies are installed.")
+    else:
+        st.info("👆 Click 'Load Stock Screener' to start screening NSE stocks.")
 
 # ═══════════════════════════════════════════════════════════════════════
 # TAB 10: NIFTY FUTURES ANALYSIS
@@ -4149,53 +4136,64 @@ with tab9:
 with tab10:
     st.markdown("# 📈 NIFTY Futures Analysis")
 
-    # Auto-load futures analysis (no lazy loading)
-    try:
-        from src.nifty_futures_ui import render_nifty_futures_dashboard
+    # LAZY LOADING - Only fetch when user clicks button (performance fix)
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        load_futures = st.button("🔄 Load Futures Data", type="primary", key="load_futures_btn")
+    with col2:
+        if 'futures_data_cache' in st.session_state:
+            st.caption("✅ Data loaded - Click to refresh")
 
-        spot_price = nifty_data.get('spot_price', 25000.0)
-        futures_data = None
+    if load_futures or 'futures_data_cache' in st.session_state:
+        try:
+            from src.nifty_futures_ui import render_nifty_futures_dashboard
 
-        # Auto-fetch on first load, cache for subsequent refreshes
-        if 'futures_data_cache' not in st.session_state:
-            with st.spinner("Loading futures data..."):
-                try:
-                    from dhan_data_fetcher import get_nifty_futures_data
-                    futures_result = get_nifty_futures_data()
+            spot_price = nifty_data.get('spot_price', 25000.0)
+            futures_data = None
 
-                    if futures_result.get('spot_price'):
-                        spot_price = futures_result['spot_price']
+            # Only fetch if button clicked (not from cache)
+            if load_futures:
+                with st.spinner("Loading futures data..."):
+                    try:
+                        from dhan_data_fetcher import get_nifty_futures_data
+                        futures_result = get_nifty_futures_data()
 
-                    if futures_result.get('success'):
-                        futures_data = {
-                            'current_month': futures_result.get('current_month', {}),
-                            'next_month': futures_result.get('next_month', {}),
-                            'data_source': futures_result.get('data_source', 'unknown')
-                        }
-                        st.session_state.futures_data_cache = futures_data
-                        st.session_state.futures_spot_cache = spot_price
-                except Exception as e:
-                    st.warning(f"Could not fetch futures data: {e}")
-        else:
-            # Use cached data
-            futures_data = st.session_state.get('futures_data_cache')
-            spot_price = st.session_state.get('futures_spot_cache', spot_price)
+                        if futures_result.get('spot_price'):
+                            spot_price = futures_result['spot_price']
 
-        option_chain_data = st.session_state.get('option_chain')
+                        if futures_result.get('success'):
+                            futures_data = {
+                                'current_month': futures_result.get('current_month', {}),
+                                'next_month': futures_result.get('next_month', {}),
+                                'data_source': futures_result.get('data_source', 'unknown')
+                            }
+                            st.session_state.futures_data_cache = futures_data
+                            st.session_state.futures_spot_cache = spot_price
+                            st.success("✅ Futures data loaded!")
+                    except Exception as e:
+                        st.warning(f"Could not fetch futures data: {e}")
+            else:
+                # Use cached data
+                futures_data = st.session_state.get('futures_data_cache')
+                spot_price = st.session_state.get('futures_spot_cache', spot_price)
 
-        render_nifty_futures_dashboard(
-            spot_price=spot_price,
-            futures_data=futures_data,
-            participant_data=None,
-            option_chain_data=option_chain_data,
-            historical_data=None
-        )
+            option_chain_data = st.session_state.get('option_chain')
 
-    except ImportError as e:
-        st.error(f"❌ Error importing NIFTY Futures UI: {e}")
-        st.info("Required: src/nifty_futures_ui.py, src/nifty_futures_analyzer.py")
-    except Exception as e:
-        st.error(f"❌ Error loading NIFTY Futures Analysis: {e}")
+            render_nifty_futures_dashboard(
+                spot_price=spot_price,
+                futures_data=futures_data,
+                participant_data=None,
+                option_chain_data=option_chain_data,
+                historical_data=None
+            )
+
+        except ImportError as e:
+            st.error(f"❌ Error importing NIFTY Futures UI: {e}")
+            st.info("Required: src/nifty_futures_ui.py, src/nifty_futures_analyzer.py")
+        except Exception as e:
+            st.error(f"❌ Error loading NIFTY Futures Analysis: {e}")
+    else:
+        st.info("👆 Click 'Load Futures Data' to view NIFTY Futures analysis.")
 
 # ═══════════════════════════════════════════════════════════════════════
 # TAB 11: AI TRAINING & MODEL MANAGEMENT
@@ -4205,20 +4203,27 @@ with tab11:
     st.markdown("# 🤖 AI Training & Model Management")
     st.caption("Train XGBoost models on real trading data | Track predictions & outcomes | Manage model versions")
 
-    # Auto-load AI Training Dashboard (no lazy loading)
-    try:
-        from src.ai_training_ui import render_ai_training_dashboard
-        render_ai_training_dashboard()
-    except ImportError as e:
-        st.error(f"❌ AI Training module not available: {e}")
-        st.info("Required: src/ai_training_ui.py, src/training_data_collector.py, src/model_trainer_pipeline.py")
-    except Exception as e:
-        st.error(f"❌ Error loading AI Training: {e}")
+    # LAZY LOADING - Only load when user clicks button (performance fix)
+    if st.button("🔄 Load AI Training Dashboard", type="primary", key="load_ai_training_btn"):
+        st.session_state.load_ai_training = True
+
+    if st.session_state.get('load_ai_training', False):
+        try:
+            with st.spinner("Loading AI Training dashboard..."):
+                from src.ai_training_ui import render_ai_training_dashboard
+                render_ai_training_dashboard()
+        except ImportError as e:
+            st.error(f"❌ AI Training module not available: {e}")
+            st.info("Required: src/ai_training_ui.py, src/training_data_collector.py, src/model_trainer_pipeline.py")
+        except Exception as e:
+            st.error(f"❌ Error loading AI Training: {e}")
+    else:
+        st.info("👆 Click 'Load AI Training Dashboard' to access AI model training and management.")
 
 # ═══════════════════════════════════════════════════════════════════════
 # FOOTER
 # ═══════════════════════════════════════════════════════════════════════
 
 st.divider()
-st.caption(f"Last Updated (IST): {get_current_time_ist().strftime('%Y-%m-%d %H:%M:%S %Z')} | Auto-refresh: {session_refresh_interval}s ({current_session.name.replace('_', ' ').title()})")
+st.caption(f"Last Updated (IST): {get_current_time_ist().strftime('%Y-%m-%d %H:%M:%S %Z')} | Auto-refresh: {AUTO_REFRESH_INTERVAL}s")
 st.caption(f"🤖 AI Market Analysis: Runs every 30 minutes during market hours | Last AI analysis: {datetime.fromtimestamp(st.session_state.last_ai_analysis_time).strftime('%H:%M:%S') if st.session_state.last_ai_analysis_time > 0 else 'Never'}")
