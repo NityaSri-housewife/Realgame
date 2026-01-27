@@ -35,7 +35,6 @@ from data_cache_manager import (
     get_cached_bias_analysis_results
 )
 from ai_tab_integration import render_master_ai_analysis_tab, render_advanced_analytics_tab
-from src.market_structure_ui import render_market_structure_section, render_structure_widget
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -900,15 +899,69 @@ if st.session_state.ai_analysis_results:
     st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════
-# PRE-LOAD OPTION SCREENER DATA (for SL Hunt Detector and other ML modules)
+# UNIFIED ML TRADING SIGNAL (Above all tabs - heavily cached for performance)
 # ═══════════════════════════════════════════════════════════════════════
-# Load option screener data silently if not already loaded
-if st.session_state.get('merged_df') is None:
+# Initialize cache variables once
+if 'unified_ml_cache_time' not in st.session_state:
+    st.session_state.unified_ml_cache_time = 0
+if 'unified_ml_generator' not in st.session_state:
+    st.session_state.unified_ml_generator = None
+
+with st.expander("🤖 **UNIFIED ML TRADING SIGNAL**", expanded=True):
     try:
-        from NiftyOptionScreener import load_option_screener_data_silently
-        load_option_screener_data_silently()
+        current_time = time.time()
+        cache_duration = 120  # Only regenerate every 120 seconds (2 minutes)
+
+        # Check if we have cached signal and it's still valid
+        cached_signal = st.session_state.get('unified_ml_signal')
+        time_since_cache = current_time - st.session_state.unified_ml_cache_time
+
+        if cached_signal is not None and time_since_cache < cache_duration:
+            # Use cached signal - no computation needed
+            from src.unified_ml_signal import render_unified_signal
+            spot_price = nifty_data.get('spot_price') if nifty_data else None
+            render_unified_signal(cached_signal, spot_price=spot_price)
+            st.caption(f"🔄 Signal updates in {int(cache_duration - time_since_cache)}s")
+        else:
+            # Need to regenerate signal - but use cached generator
+            from src.unified_ml_signal import UnifiedMLSignalGenerator, render_unified_signal
+
+            # Create generator once and reuse (major performance fix)
+            if st.session_state.unified_ml_generator is None:
+                st.session_state.unified_ml_generator = UnifiedMLSignalGenerator()
+
+            df_for_signal = get_cached_chart_data('^NSEI', '1d', '5m')
+
+            if df_for_signal is not None and len(df_for_signal) > 0:
+                st.session_state.chart_data = df_for_signal
+
+                option_chain = st.session_state.get('option_chain_data')
+                vix_current = st.session_state.get('vix_current', 15.0)
+                spot_price = nifty_data.get('spot_price') if nifty_data else None
+                # Safely get bias_results - handle None case
+                bias_analysis = st.session_state.get('bias_analysis_results')
+                bias_results = bias_analysis.get('bias_results') if isinstance(bias_analysis, dict) else None
+
+                # Use cached generator instead of creating new one
+                unified_signal = st.session_state.unified_ml_generator.generate_signal(
+                    df=df_for_signal,
+                    option_chain=option_chain,
+                    vix_current=vix_current,
+                    spot_price=spot_price,
+                    bias_results=bias_results
+                )
+
+                # Cache the signal
+                st.session_state.unified_ml_signal = unified_signal
+                st.session_state.unified_ml_cache_time = current_time
+
+                render_unified_signal(unified_signal, spot_price=spot_price)
+            else:
+                st.info("⏳ Loading market data... Unified signal will appear once data is available.")
     except Exception as e:
-        pass  # Silently fail - will retry in tab
+        st.warning(f"⚠️ ML Signal temporarily unavailable: {str(e)}")
+
+st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════
 # TABS - USING NATIVE STREAMLIT TABS FOR BETTER UX
@@ -918,7 +971,7 @@ if st.session_state.get('merged_df') is None:
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "🌟 Overall Market Sentiment",
     "🎯 Trade Setup",
-    "📊 Active Signals & Structure",
+    "📊 Active Signals",
     "📈 Positions",
     "🎲 Bias Analysis Pro",
     "📉 Advanced Chart Analysis",
@@ -1226,96 +1279,6 @@ with tab3:
                                         st.error(f"Error: {result['error']}")
 
                 st.divider()
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # MARKET STRUCTURE ANALYSIS SECTION (Inside Active Signals Tab)
-    # ═══════════════════════════════════════════════════════════════════════
-
-    st.markdown("---")
-    st.markdown("## 🧠 Market Structure Analysis")
-    st.caption("Structure-based detection BEFORE price moves | Probability Engine | Expiry Patterns")
-
-    # Load Market Structure Analysis
-    try:
-        # Get OHLC data from multiple sources (prioritize freshest)
-        ohlc_df = None
-        option_data = None
-        spot_price = None
-        is_expiry = False
-        nifty_data_struct = None  # Initialize to avoid reference errors
-
-        # SOURCE 1: PRIMARY - st.session_state.chart_data (used by Unified ML - MOST RELIABLE)
-        if 'chart_data' in st.session_state:
-            chart_data = st.session_state.get('chart_data')
-            if isinstance(chart_data, pd.DataFrame) and len(chart_data) > 0:
-                ohlc_df = chart_data.copy()
-
-        # SOURCE 2: data_df from Option Screener
-        if ohlc_df is None and 'data_df' in st.session_state:
-            chart_data = st.session_state.get('data_df')
-            if isinstance(chart_data, pd.DataFrame) and len(chart_data) > 0:
-                ohlc_df = chart_data.copy()
-
-        # SOURCE 3: nifty_df alternative
-        if ohlc_df is None and 'nifty_df' in st.session_state:
-            chart_data = st.session_state.get('nifty_df')
-            if isinstance(chart_data, pd.DataFrame) and len(chart_data) > 0:
-                ohlc_df = chart_data.copy()
-
-        # SOURCE 4: Try data cache manager
-        if ohlc_df is None:
-            nifty_data_struct = get_cached_nifty_data()
-            if nifty_data_struct and 'chart_data' in nifty_data_struct:
-                chart_data = nifty_data_struct['chart_data']
-                if isinstance(chart_data, pd.DataFrame) and len(chart_data) > 0:
-                    ohlc_df = chart_data
-
-        # Get spot price from multiple sources
-        if 'nifty_spot' in st.session_state and st.session_state['nifty_spot']:
-            spot_price = st.session_state['nifty_spot']
-        elif 'last_spot_price' in st.session_state and st.session_state.get('last_spot_price'):
-            spot_price = st.session_state.last_spot_price
-        elif nifty_data_struct and 'spot_price' in nifty_data_struct:
-            spot_price = nifty_data_struct['spot_price']
-        elif ohlc_df is not None and len(ohlc_df) > 0 and 'close' in ohlc_df.columns:
-            spot_price = float(ohlc_df['close'].iloc[-1])
-
-        # Get option data from multiple sources
-        if 'merged_df' in st.session_state:
-            merged = st.session_state.get('merged_df')
-            if isinstance(merged, pd.DataFrame) and len(merged) > 0:
-                option_data = {'merged_df': merged, 'source': 'option_screener'}
-
-        if option_data is None and 'overall_option_data' in st.session_state:
-            screener_data = st.session_state.get('overall_option_data', {}).get('NIFTY', {})
-            if screener_data:
-                option_data = screener_data
-
-        if option_data is None:
-            option_data = {}
-
-        # Add extras
-        if 'atm_strike' in st.session_state:
-            option_data['atm_strike'] = st.session_state['atm_strike']
-        if 'market_depth_data' in st.session_state:
-            option_data['market_depth'] = st.session_state['market_depth_data']
-
-        # Check expiry day
-        today = datetime.now()
-        is_expiry = today.weekday() == 3  # Thursday
-
-        if ohlc_df is not None and len(ohlc_df) > 20:
-            render_market_structure_section(
-                ohlc_df=ohlc_df,
-                option_data=option_data,
-                is_expiry=is_expiry,
-                spot_price=spot_price
-            )
-        else:
-            st.info("📊 Load chart data from **Overall Market Sentiment** or **NIFTY Option Screener** tab to see Market Structure Analysis.")
-
-    except Exception as e:
-        st.warning(f"Market Structure module loading: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════
 # TAB 4: POSITIONS
