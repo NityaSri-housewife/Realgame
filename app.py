@@ -899,6 +899,17 @@ if st.session_state.ai_analysis_results:
     st.divider()
 
 # ═══════════════════════════════════════════════════════════════════════
+# PRE-LOAD OPTION SCREENER DATA (for SL Hunt Detector and other ML modules)
+# ═══════════════════════════════════════════════════════════════════════
+# Load option screener data silently if not already loaded
+if st.session_state.get('merged_df') is None:
+    try:
+        from NiftyOptionScreener import load_option_screener_data_silently
+        load_option_screener_data_silently()
+    except Exception as e:
+        pass  # Silently fail - will retry in tab
+
+# ═══════════════════════════════════════════════════════════════════════
 # UNIFIED ML TRADING SIGNAL (Above all tabs - heavily cached for performance)
 # ═══════════════════════════════════════════════════════════════════════
 # Initialize cache variables once
@@ -930,10 +941,55 @@ with st.expander("🤖 **UNIFIED ML TRADING SIGNAL**", expanded=True):
             if st.session_state.unified_ml_generator is None:
                 st.session_state.unified_ml_generator = UnifiedMLSignalGenerator()
 
-            df_for_signal = get_cached_chart_data('^NSEI', '1d', '5m')
+            # Try multiple sources for chart data
+            df_for_signal = None
+
+            # 1. First try session_state chart_data (from tabs)
+            try:
+                cached_chart = st.session_state.get('chart_data')
+                if cached_chart is not None and hasattr(cached_chart, '__len__') and len(cached_chart) > 0:
+                    df_for_signal = cached_chart
+            except:
+                pass
+
+            # 2. Try nifty_data chart_data (from initial load)
+            if df_for_signal is None:
+                try:
+                    if nifty_data and nifty_data.get('chart_data') is not None:
+                        chart_data_raw = nifty_data.get('chart_data')
+                        if hasattr(chart_data_raw, '__len__') and len(chart_data_raw) > 0:
+                            df_for_signal = chart_data_raw
+                            st.session_state.chart_data = df_for_signal
+                except:
+                    pass
+
+            # 3. Try to fetch from API
+            if df_for_signal is None:
+                try:
+                    df_for_signal = get_cached_chart_data('^NSEI', '1d', '5m')
+                    if df_for_signal is not None and len(df_for_signal) > 0:
+                        st.session_state.chart_data = df_for_signal
+                except:
+                    pass
+
+            # 4. Last resort - create minimal DataFrame from nifty_data OHLC
+            if df_for_signal is None and nifty_data and nifty_data.get('spot_price'):
+                try:
+                    import pandas as pd
+                    from datetime import datetime
+                    # Create minimal DataFrame with current OHLC
+                    df_for_signal = pd.DataFrame({
+                        'open': [nifty_data.get('open', nifty_data['spot_price'])],
+                        'high': [nifty_data.get('high', nifty_data['spot_price'])],
+                        'low': [nifty_data.get('low', nifty_data['spot_price'])],
+                        'close': [nifty_data.get('spot_price')],
+                        'volume': [0]
+                    }, index=[datetime.now()])
+                    st.session_state.chart_data = df_for_signal
+                except:
+                    pass
 
             if df_for_signal is not None and len(df_for_signal) > 0:
-                st.session_state.chart_data = df_for_signal
 
                 option_chain = st.session_state.get('option_chain_data')
                 vix_current = st.session_state.get('vix_current', 15.0)
