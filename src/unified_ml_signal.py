@@ -11,6 +11,7 @@ Modules Combined:
 5. CVD Delta Imbalance
 6. Liquidity Gravity Analysis
 7. Institutional vs Retail Detection
+8. Expiry Day Killer (False Breakout Filter)
 
 Output: Single unified trading signal with confidence score
 """
@@ -23,6 +24,65 @@ from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import logging
+
+# Import Expiry Day Killer
+try:
+    from src.expiry_day_killer import ExpiryDayKiller, format_killer_result
+except ImportError:
+    try:
+        from expiry_day_killer import ExpiryDayKiller, format_killer_result
+    except ImportError:
+        ExpiryDayKiller = None
+        format_killer_result = None
+
+# Import SL Hunt Detector
+try:
+    from src.sl_hunt_detector import (
+        SLHuntDetector, SLHuntResult, TrapZone,
+        format_sl_hunt_telegram, format_hunt_candle_telegram
+    )
+except ImportError:
+    try:
+        from sl_hunt_detector import (
+            SLHuntDetector, SLHuntResult, TrapZone,
+            format_sl_hunt_telegram, format_hunt_candle_telegram
+        )
+    except ImportError:
+        SLHuntDetector = None
+        SLHuntResult = None
+        TrapZone = None
+        format_sl_hunt_telegram = None
+        format_hunt_candle_telegram = None
+
+# Import Real ML Training System
+try:
+    from src.ml_data_collector import get_data_collector, record_trading_signal
+    from src.ml_real_trainer import get_trainer, predict_with_real_model
+    ML_REAL_TRAINING_AVAILABLE = True
+except ImportError:
+    ML_REAL_TRAINING_AVAILABLE = False
+    get_data_collector = None
+    record_trading_signal = None
+    get_trainer = None
+    predict_with_real_model = None
+
+# Import Smart Alert System
+try:
+    from src.smart_alert_system import get_alert_system, check_and_send_alerts
+    SMART_ALERTS_AVAILABLE = True
+except ImportError:
+    SMART_ALERTS_AVAILABLE = False
+    get_alert_system = None
+    check_and_send_alerts = None
+
+# Import FII/DII Fetcher
+try:
+    from src.fii_dii_fetcher import get_fii_dii_data, FIIDIIData
+    FII_DII_AVAILABLE = True
+except ImportError:
+    FII_DII_AVAILABLE = False
+    get_fii_dii_data = None
+    FIIDIIData = None
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +170,490 @@ def send_ml_signal_telegram(signal, spot_price: float = None):
     except Exception as e:
         logger.error(f"Telegram send error: {e}")
         return False, f"Error: {str(e)}"
+
+
+def send_reversal_entry_telegram(
+    spot_price: float,
+    reversal_zone: dict,
+    signal_type: str,  # "SUPPORT" or "RESISTANCE"
+    strike_pcr: float,
+    confluence_detail: str = "",
+    reversal_probability: int = 0,
+    exact_reversal_price: float = None,
+    killer_result = None  # ExpiryKillerResult from expiry_day_killer.py
+):
+    """
+    Send Telegram alert when price enters EXACT REVERSAL zone
+
+    Triggers when:
+    - Price enters OI Wall entry zone
+    - Multiple confluence factors align (HTF + Fib + BOS + CHOCH)
+    - Reversal probability >= 75%
+    - Expiry Day Killer filters pass
+    """
+    try:
+        # Get Telegram credentials
+        bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
+
+        if not bot_token or not chat_id:
+            return False, "Telegram not configured"
+
+        # Create unique signal key to avoid duplicates
+        zone_price = reversal_zone.get('entry_from', 0)
+        signal_key = f"REVERSAL_{signal_type}_{int(zone_price)}_{datetime.now().strftime('%Y%m%d%H%M')}"
+
+        if 'last_reversal_telegram' in st.session_state:
+            if st.session_state.last_reversal_telegram == signal_key:
+                return False, "Entry signal already sent"
+
+        # Determine trade direction
+        if signal_type == "SUPPORT":
+            emoji = "🟢📈"
+            action = "BUY CALL"
+            direction = "BULLISH REVERSAL"
+            entry_logic = "Price at SUPPORT - Expect bounce UP"
+        else:
+            emoji = "🔴📉"
+            action = "BUY PUT"
+            direction = "BEARISH REVERSAL"
+            entry_logic = "Price at RESISTANCE - Expect rejection DOWN"
+
+        # Entry zone details
+        entry_from = reversal_zone.get('entry_from', 0)
+        entry_to = reversal_zone.get('entry_to', 0)
+        strength = reversal_zone.get('strength', 'MEDIUM')
+        buffer = reversal_zone.get('buffer', '±20')
+
+        # Strength indicator
+        strength_emoji = "🟢" if strength == "STRONG" else "🟡" if strength == "MEDIUM" else "🔴"
+
+        # Killer analysis section
+        killer_section = ""
+        if killer_result is not None:
+            risk_emoji = "🟢" if killer_result.risk_level == "LOW" else "🟡" if killer_result.risk_level == "MEDIUM" else "🔴"
+            killer_section = f"""
+🛡️ *EXPIRY DAY KILLER ANALYSIS:*
+• Safety Score: {killer_result.overall_score:.0f}/100
+• Risk Level: {risk_emoji} {killer_result.risk_level}
+• Volume: {killer_result.volume_ratio:.1f}x avg {'✅' if killer_result.volume_filter.value == 'PASSED' else '⚠️'}
+• Retest: {'✅ Confirmed' if killer_result.retest_confirmed else '⏳ Pending'}
+• OI Wall: {'✅ Aligned' if killer_result.oi_wall_aligned else '⚠️ Opposing'}
+• Max Pain: {'✅ Aligned' if killer_result.max_pain_aligned else '⚠️ Opposing'}
+"""
+            if killer_result.is_expiry_day:
+                killer_section += f"• ⚠️ EXPIRY DAY - {killer_result.minutes_to_close} mins to close\n"
+
+        # Build message
+        message = f"""
+🎯 *EXACT REVERSAL ENTRY SIGNAL* 🎯
+
+{emoji} *{direction}* {emoji}
+
+📍 *Entry Zone Triggered!*
+• Spot Price: ₹{spot_price:,.0f}
+• Entry Zone: ₹{entry_from:,.0f} - ₹{entry_to:,.0f}
+• Exact Reversal: ₹{exact_reversal_price:,.0f}
+
+💪 *Strength:* {strength_emoji} {strength}
+📊 *Strike PCR:* {strike_pcr}
+🎯 *Reversal Probability:* {reversal_probability}%
+
+⚡ *Confluence Factors:*
+{confluence_detail if confluence_detail else "OI Wall + PCR"}
+{killer_section}
+🎬 *ACTION:* {action}
+📝 *Logic:* {entry_logic}
+
+⚠️ *Risk Management:*
+• SL: ₹{entry_from - 30 if signal_type == "SUPPORT" else entry_to + 30:,.0f}
+• Buffer: {buffer}
+
+⏰ _{datetime.now().strftime('%H:%M:%S')}_
+⚡ _Exact Reversal + Expiry Killer System_
+"""
+
+        # Send to Telegram
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        response = requests.post(url, json=payload, timeout=10)
+
+        if response.status_code == 200:
+            st.session_state.last_reversal_telegram = signal_key
+            return True, "Entry signal sent to Telegram!"
+        else:
+            return False, f"Failed: {response.status_code}"
+
+    except Exception as e:
+        logger.error(f"Telegram reversal entry error: {e}")
+        return False, f"Error: {str(e)}"
+
+
+def send_sl_hunt_telegram(result, spot_price: float):
+    """
+    Send SL Hunt Alert to Telegram when high probability hunt is detected
+
+    Sends warning BEFORE the hunt happens so traders can:
+    1. Avoid entering breakout trades
+    2. Wait for hunt candle
+    3. Trade the reversal AFTER the hunt
+    """
+    try:
+        if format_sl_hunt_telegram is None:
+            return False, "SL Hunt module not loaded"
+
+        # Get Telegram credentials
+        bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
+
+        if not bot_token or not chat_id:
+            return False, "Telegram not configured"
+
+        # Only send if hunt is likely
+        if not result.hunt_likely:
+            return False, "No hunt detected"
+
+        # Create unique signal key to avoid duplicates
+        signal_key = f"SL_HUNT_{result.hunt_direction}_{int(result.hunt_probability)}_{datetime.now().strftime('%Y%m%d%H%M')}"
+
+        if 'last_sl_hunt_telegram' in st.session_state:
+            if st.session_state.last_sl_hunt_telegram == signal_key:
+                return False, "Hunt alert already sent"
+
+        # Format message
+        message = format_sl_hunt_telegram(result, spot_price)
+
+        if not message:
+            return False, "No message to send"
+
+        # Send to Telegram
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        response = requests.post(url, json=payload, timeout=10)
+
+        if response.status_code == 200:
+            st.session_state.last_sl_hunt_telegram = signal_key
+            return True, "SL Hunt alert sent to Telegram!"
+        else:
+            return False, f"Failed: {response.status_code}"
+
+    except Exception as e:
+        logger.error(f"Telegram SL Hunt error: {e}")
+        return False, f"Error: {str(e)}"
+
+
+def analyze_sl_hunt(
+    spot_price: float,
+    df: pd.DataFrame = None,
+    oi_data: dict = None,
+    vwap: float = None,
+    prev_day_high: float = None,
+    prev_day_low: float = None,
+    support_levels: list = None,
+    resistance_levels: list = None,
+    auto_send: bool = True
+):
+    """
+    Analyze for potential stop-loss hunting and optionally send Telegram alert
+
+    This function:
+    1. Runs the complete SL Hunt analysis
+    2. Stores result in session state
+    3. Sends Telegram alert if hunt probability is high
+    4. Returns the analysis result
+
+    Returns:
+        SLHuntResult or None
+    """
+    if SLHuntDetector is None:
+        return None
+
+    try:
+        # Initialize detector
+        detector = SLHuntDetector(
+            morning_hunt_start=datetime.strptime("09:15", "%H:%M").time(),
+            morning_hunt_end=datetime.strptime("10:00", "%H:%M").time(),
+            closing_hunt_start=datetime.strptime("14:30", "%H:%M").time(),
+            closing_hunt_end=datetime.strptime("15:30", "%H:%M").time(),
+            hunt_probability_threshold=65,
+        )
+
+        # Get chart DataFrame from session state if not provided
+        # Priority: chart_data (from Advanced Chart) > nifty_df
+        if df is None:
+            df = st.session_state.get('chart_data')
+            if df is None:
+                df = st.session_state.get('nifty_df')
+
+        # Get merged_df from NIFTY Option Screener (contains OI_CE, OI_PE, Chg_OI_CE, etc.)
+        merged_df = st.session_state.get('merged_df')
+
+        # Get market depth data
+        market_depth = st.session_state.get('market_depth_data')
+
+        # Get OI data from session state if not provided
+        if oi_data is None:
+            oi_data = {}
+            try:
+                nifty_screener = st.session_state.get('nifty_screener_data', {})
+                oi_pcr_metrics = nifty_screener.get('oi_pcr_metrics', {}) if isinstance(nifty_screener, dict) else {}
+                option_data = st.session_state.get('overall_option_data', {}).get('NIFTY', {})
+
+                # Build OI data structure
+                oi_data = {
+                    'call_oi': oi_pcr_metrics.get('call_oi', {}),
+                    'put_oi': oi_pcr_metrics.get('put_oi', {}),
+                    'call_oi_change': oi_pcr_metrics.get('call_oi_change', {}),
+                    'put_oi_change': oi_pcr_metrics.get('put_oi_change', {}),
+                    'call_premium_change': oi_pcr_metrics.get('call_premium_change', {}),
+                    'put_premium_change': oi_pcr_metrics.get('put_premium_change', {}),
+                    'max_call_strike': oi_pcr_metrics.get('max_call_strike', 0),
+                    'max_put_strike': oi_pcr_metrics.get('max_put_strike', 0),
+                    'max_pain': option_data.get('max_pain', 0)
+                }
+            except:
+                pass
+
+        # Get support/resistance from session state if not provided
+        if support_levels is None:
+            support_levels = []
+            try:
+                regime_data = st.session_state.get('ml_regime_result', {})
+                sr_data = regime_data.get('support_resistance', {})
+                for s in sr_data.get('supports', []):
+                    support_levels.append(float(s) if isinstance(s, (int, float)) else s.get('price', 0))
+            except:
+                pass
+
+        if resistance_levels is None:
+            resistance_levels = []
+            try:
+                regime_data = st.session_state.get('ml_regime_result', {})
+                sr_data = regime_data.get('support_resistance', {})
+                for r in sr_data.get('resistances', []):
+                    resistance_levels.append(float(r) if isinstance(r, (int, float)) else r.get('price', 0))
+            except:
+                pass
+
+        # Run analysis with all data sources
+        result = detector.analyze(
+            spot_price=spot_price,
+            df=df,
+            oi_data=oi_data,
+            merged_df=merged_df,  # From NIFTY Option Screener
+            market_depth=market_depth,  # From get_market_depth_dhan()
+            vwap=vwap,
+            prev_day_high=prev_day_high,
+            prev_day_low=prev_day_low,
+            support_levels=support_levels,
+            resistance_levels=resistance_levels,
+        )
+
+        # Store in session state
+        st.session_state['sl_hunt_result'] = result
+
+        # Send Telegram if hunt likely and auto_send enabled
+        if auto_send and result.hunt_likely and result.hunt_probability >= 70:
+            success, msg = send_sl_hunt_telegram(result, spot_price)
+            if success:
+                st.session_state['sl_hunt_telegram_sent'] = True
+
+        return result
+
+    except Exception as e:
+        logger.error(f"SL Hunt analysis error: {e}")
+        return None
+
+
+def check_and_send_reversal_entry(
+    spot_price: float,
+    support_levels: list,
+    resistance_levels: list,
+    auto_send: bool = True,
+    df: pd.DataFrame = None,
+    oi_data: dict = None,
+    days_to_expiry: float = 7.0
+):
+    """
+    Check if price is in any exact reversal zone and send Telegram alert
+    Uses Expiry Day Killer to filter false breakouts
+
+    Returns: List of triggered entry signals with killer analysis
+    """
+    triggered_entries = []
+
+    if not spot_price or not auto_send:
+        return triggered_entries
+
+    # Initialize Expiry Day Killer if available
+    killer = None
+    if ExpiryDayKiller is not None:
+        killer = ExpiryDayKiller(
+            expiry_cutoff_minutes=90,  # Block in last 90 mins on expiry
+            volume_confirmation_ratio=1.5,  # Need 1.5x avg volume
+            oi_wall_distance_threshold=50,  # Don't break INTO OI wall within 50 pts
+            max_pain_alignment_threshold=30  # Max pain should align within 30 pts
+        )
+
+    # Get OI data from session state if not provided
+    if oi_data is None:
+        oi_data = {}
+        try:
+            nifty_screener = st.session_state.get('nifty_screener_data', {})
+            oi_pcr_metrics = nifty_screener.get('oi_pcr_metrics', {}) if isinstance(nifty_screener, dict) else {}
+            option_data = st.session_state.get('overall_option_data', {}).get('NIFTY', {})
+
+            oi_data = {
+                'max_call_strike': oi_pcr_metrics.get('max_call_strike', 0),
+                'max_put_strike': oi_pcr_metrics.get('max_put_strike', 0),
+                'max_pain': option_data.get('max_pain', 0)
+            }
+        except:
+            pass
+
+    # Get DataFrame from session state if not provided
+    if df is None:
+        df = st.session_state.get('nifty_df')
+
+    # Check support levels (price near or below support = potential LONG entry)
+    for supp in support_levels:
+        if supp.get('is_exact_reversal') and supp.get('entry_zone'):
+            entry_zone = supp['entry_zone']
+            entry_from = entry_zone.get('entry_from', 0)
+            entry_to = entry_zone.get('entry_to', 0)
+
+            # Check if spot price is within entry zone
+            if entry_from <= spot_price <= entry_to:
+                reversal_prob = supp.get('reversal_probability', 0)
+                if reversal_prob >= 75:
+                    # ═══════════════════════════════════════════════════════════
+                    # EXPIRY DAY KILLER CHECK - Filter false breakouts
+                    # ═══════════════════════════════════════════════════════════
+                    killer_result = None
+                    entry_allowed = True
+                    killer_msg = ""
+
+                    if killer is not None:
+                        killer_result = killer.analyze(
+                            spot_price=spot_price,
+                            entry_type="SUPPORT",
+                            entry_zone=entry_zone,
+                            df=df,
+                            oi_data=oi_data,
+                            days_to_expiry=days_to_expiry
+                        )
+                        entry_allowed = killer_result.entry_allowed
+                        killer_msg = killer_result.recommendation
+
+                        # Store killer result in session state for display
+                        st.session_state['last_killer_result'] = killer_result
+
+                    if entry_allowed:
+                        success, msg = send_reversal_entry_telegram(
+                            spot_price=spot_price,
+                            reversal_zone=entry_zone,
+                            signal_type="SUPPORT",
+                            strike_pcr=supp.get('strike_pcr', 1.0),
+                            confluence_detail=supp.get('confluence_detail', ''),
+                            reversal_probability=reversal_prob,
+                            exact_reversal_price=supp.get('exact_reversal_price', supp['price']),
+                            killer_result=killer_result
+                        )
+                        triggered_entries.append({
+                            'type': 'SUPPORT',
+                            'price': supp['price'],
+                            'success': success,
+                            'message': msg,
+                            'killer_score': killer_result.overall_score if killer_result else 100,
+                            'killer_allowed': True
+                        })
+                    else:
+                        # Entry blocked by Expiry Day Killer
+                        triggered_entries.append({
+                            'type': 'SUPPORT',
+                            'price': supp['price'],
+                            'success': False,
+                            'message': f"BLOCKED: {killer_msg}",
+                            'killer_score': killer_result.overall_score if killer_result else 0,
+                            'killer_allowed': False,
+                            'block_reasons': killer_result.block_reasons if killer_result else []
+                        })
+
+    # Check resistance levels (price near or above resistance = potential SHORT entry)
+    for res in resistance_levels:
+        if res.get('is_exact_reversal') and res.get('entry_zone'):
+            entry_zone = res['entry_zone']
+            entry_from = entry_zone.get('entry_from', 0)
+            entry_to = entry_zone.get('entry_to', 0)
+
+            # Check if spot price is within entry zone
+            if entry_from <= spot_price <= entry_to:
+                reversal_prob = res.get('reversal_probability', 0)
+                if reversal_prob >= 75:
+                    # ═══════════════════════════════════════════════════════════
+                    # EXPIRY DAY KILLER CHECK - Filter false breakouts
+                    # ═══════════════════════════════════════════════════════════
+                    killer_result = None
+                    entry_allowed = True
+                    killer_msg = ""
+
+                    if killer is not None:
+                        killer_result = killer.analyze(
+                            spot_price=spot_price,
+                            entry_type="RESISTANCE",
+                            entry_zone=entry_zone,
+                            df=df,
+                            oi_data=oi_data,
+                            days_to_expiry=days_to_expiry
+                        )
+                        entry_allowed = killer_result.entry_allowed
+                        killer_msg = killer_result.recommendation
+
+                        # Store killer result in session state for display
+                        st.session_state['last_killer_result'] = killer_result
+
+                    if entry_allowed:
+                        success, msg = send_reversal_entry_telegram(
+                            spot_price=spot_price,
+                            reversal_zone=entry_zone,
+                            signal_type="RESISTANCE",
+                            strike_pcr=res.get('strike_pcr', 1.0),
+                            confluence_detail=res.get('confluence_detail', ''),
+                            reversal_probability=reversal_prob,
+                            exact_reversal_price=res.get('exact_reversal_price', res['price']),
+                            killer_result=killer_result
+                        )
+                        triggered_entries.append({
+                            'type': 'RESISTANCE',
+                            'price': res['price'],
+                            'success': success,
+                            'message': msg,
+                            'killer_score': killer_result.overall_score if killer_result else 100,
+                            'killer_allowed': True
+                        })
+                    else:
+                        # Entry blocked by Expiry Day Killer
+                        triggered_entries.append({
+                            'type': 'RESISTANCE',
+                            'price': res['price'],
+                            'success': False,
+                            'message': f"BLOCKED: {killer_msg}",
+                            'killer_score': killer_result.overall_score if killer_result else 0,
+                            'killer_allowed': False,
+                            'block_reasons': killer_result.block_reasons if killer_result else []
+                        })
+
+    return triggered_entries
 
 
 @dataclass
@@ -235,6 +779,44 @@ class UnifiedMLSignalGenerator:
             self.modules_loaded['institutional'] = False
             self.institutional_detector = None
 
+        # ========== DIAMOND LEVEL FEATURES ==========
+
+        # Cumulative Delta (CVD) - Order Flow Analysis
+        try:
+            from src.cumulative_delta import CumulativeDeltaAnalyzer
+            self.cvd_diamond_analyzer = CumulativeDeltaAnalyzer()
+            self.modules_loaded['cvd_diamond'] = True
+        except ImportError:
+            self.modules_loaded['cvd_diamond'] = False
+            self.cvd_diamond_analyzer = None
+
+        # Gamma Wall Flip Detector
+        try:
+            from src.gamma_wall_flip import GammaWallFlipDetector
+            self.gamma_flip_detector = GammaWallFlipDetector()
+            self.modules_loaded['gamma_flip'] = True
+        except ImportError:
+            self.modules_loaded['gamma_flip'] = False
+            self.gamma_flip_detector = None
+
+        # Black Order Detector (Hidden Institutional Orders)
+        try:
+            from src.black_order_detector import BlackOrderDetector
+            self.black_order_detector = BlackOrderDetector()
+            self.modules_loaded['black_order'] = True
+        except ImportError:
+            self.modules_loaded['black_order'] = False
+            self.black_order_detector = None
+
+        # Block Trade Detector (Institutional Footprints)
+        try:
+            from src.block_trade_detector import BlockTradeDetector
+            self.block_trade_detector = BlockTradeDetector()
+            self.modules_loaded['block_trade'] = True
+        except ImportError:
+            self.modules_loaded['block_trade'] = False
+            self.block_trade_detector = None
+
     def generate_signal(
         self,
         df: pd.DataFrame,
@@ -277,7 +859,12 @@ class UnifiedMLSignalGenerator:
             'oi_trap': 0,
             'cvd': 0,
             'liquidity': 0,
-            'institutional': 0
+            'institutional': 0,
+            # DIAMOND LEVEL SCORES
+            'cvd_diamond': 50,  # Cumulative Delta
+            'gamma_flip': 50,  # Gamma Wall Flip
+            'black_order': 50,  # Black/Hidden Orders
+            'block_trade': 50  # Block Trades
         }
 
         bullish_reasons = []
@@ -514,30 +1101,162 @@ class UnifiedMLSignalGenerator:
         except Exception as e:
             logger.warning(f"Spike detection integration failed: {e}")
 
+        # 9. DIAMOND LEVEL FEATURES (Institutional-Grade Analysis)
+        diamond_signals = []
+
+        # 9a. Cumulative Delta (CVD) - Order Flow Analysis
+        if self.cvd_diamond_analyzer:
+            try:
+                cvd_result = self.cvd_diamond_analyzer.analyze(df)
+                if cvd_result:
+                    scores['cvd_diamond'] = cvd_result.score
+                    st.session_state['cvd_diamond_result'] = {
+                        'score': cvd_result.score,
+                        'bias': cvd_result.overall_bias,
+                        'trend': cvd_result.cvd_trend,
+                        'institutional_activity': cvd_result.institutional_activity,
+                        'smart_money_direction': cvd_result.smart_money_direction,
+                        'signals': [s.description for s in cvd_result.signals] if cvd_result.signals else []
+                    }
+                    if cvd_result.overall_bias == 'BULLISH':
+                        bullish_reasons.append(f"💎 CVD: {cvd_result.institutional_activity} ({cvd_result.score:.0f})")
+                        diamond_signals.append(('BULLISH', cvd_result.score))
+                    elif cvd_result.overall_bias == 'BEARISH':
+                        bearish_reasons.append(f"💎 CVD: {cvd_result.institutional_activity} ({cvd_result.score:.0f})")
+                        diamond_signals.append(('BEARISH', 100 - cvd_result.score))
+            except Exception as e:
+                logger.warning(f"CVD Diamond analysis failed: {e}")
+
+        # 9b. Gamma Wall Flip Detector
+        if self.gamma_flip_detector:
+            try:
+                merged_df = st.session_state.get('merged_df')
+                gamma_result = self.gamma_flip_detector.analyze(merged_df, spot_price)
+                if gamma_result:
+                    scores['gamma_flip'] = gamma_result.score
+                    st.session_state['gamma_flip_result'] = {
+                        'score': gamma_result.score,
+                        'gex_regime': gamma_result.gex_regime,
+                        'flip_signal': gamma_result.flip_signal.signal_type if gamma_result.flip_signal else None,
+                        'call_wall': gamma_result.call_wall,
+                        'put_wall': gamma_result.put_wall,
+                        'volatility_expectation': gamma_result.volatility_expectation,
+                        'description': gamma_result.description
+                    }
+                    if gamma_result.trade_bias == 'BULLISH':
+                        bullish_reasons.append(f"💎 Gamma: {gamma_result.gex_regime} ({gamma_result.score:.0f})")
+                        diamond_signals.append(('BULLISH', gamma_result.score))
+                    elif gamma_result.trade_bias == 'BEARISH':
+                        bearish_reasons.append(f"💎 Gamma: {gamma_result.gex_regime} ({gamma_result.score:.0f})")
+                        diamond_signals.append(('BEARISH', 100 - gamma_result.score))
+                    # Flip signal is critical - always report
+                    if gamma_result.flip_signal:
+                        flip_msg = f"⚠️ GEX FLIP: {gamma_result.flip_signal.signal_type} - {gamma_result.flip_signal.trade_implications}"
+                        if gamma_result.flip_signal.urgency == 'IMMEDIATE':
+                            bullish_reasons.append(flip_msg) if 'POSITIVE' in gamma_result.flip_signal.signal_type else bearish_reasons.append(flip_msg)
+            except Exception as e:
+                logger.warning(f"Gamma Flip analysis failed: {e}")
+
+        # 9c. Black Order Detector (Hidden Institutional Orders)
+        if self.black_order_detector:
+            try:
+                market_depth = st.session_state.get('market_depth_data')
+                black_result = self.black_order_detector.analyze(market_depth, df)
+                if black_result:
+                    scores['black_order'] = black_result.score
+                    st.session_state['black_order_result'] = {
+                        'score': black_result.score,
+                        'institutional_presence': black_result.institutional_presence,
+                        'smart_money_bias': black_result.smart_money_bias,
+                        'signals': len(black_result.signals),
+                        'description': black_result.description
+                    }
+                    if black_result.smart_money_bias == 'BULLISH' and black_result.institutional_presence in ['STRONG', 'MODERATE']:
+                        bullish_reasons.append(f"💎 Hidden Orders: {black_result.institutional_presence} ({black_result.score:.0f})")
+                        diamond_signals.append(('BULLISH', black_result.score))
+                    elif black_result.smart_money_bias == 'BEARISH' and black_result.institutional_presence in ['STRONG', 'MODERATE']:
+                        bearish_reasons.append(f"💎 Hidden Orders: {black_result.institutional_presence} ({black_result.score:.0f})")
+                        diamond_signals.append(('BEARISH', 100 - black_result.score))
+            except Exception as e:
+                logger.warning(f"Black Order analysis failed: {e}")
+
+        # 9d. Block Trade Detector (Institutional Footprints)
+        if self.block_trade_detector:
+            try:
+                merged_df = st.session_state.get('merged_df')
+                market_depth = st.session_state.get('market_depth_data')
+                block_result = self.block_trade_detector.analyze(df, merged_df, market_depth)
+                if block_result:
+                    scores['block_trade'] = block_result.score
+                    st.session_state['block_trade_result'] = {
+                        'score': block_result.score,
+                        'institutional_bias': block_result.institutional_bias,
+                        'activity_level': block_result.activity_level,
+                        'bullish_blocks': block_result.bullish_blocks,
+                        'bearish_blocks': block_result.bearish_blocks,
+                        'total_volume': block_result.total_block_volume,
+                        'description': block_result.description
+                    }
+                    if block_result.institutional_bias == 'ACCUMULATING' and block_result.activity_level in ['HEAVY', 'MODERATE']:
+                        bullish_reasons.append(f"💎 Blocks: {block_result.activity_level} ({block_result.bullish_blocks} buys)")
+                        diamond_signals.append(('BULLISH', block_result.score))
+                    elif block_result.institutional_bias == 'DISTRIBUTING' and block_result.activity_level in ['HEAVY', 'MODERATE']:
+                        bearish_reasons.append(f"💎 Blocks: {block_result.activity_level} ({block_result.bearish_blocks} sells)")
+                        diamond_signals.append(('BEARISH', 100 - block_result.score))
+            except Exception as e:
+                logger.warning(f"Block Trade analysis failed: {e}")
+
+        # Calculate Diamond consensus
+        diamond_score = 50  # Neutral
+        if diamond_signals:
+            bullish_diamond = sum(s[1] for s in diamond_signals if s[0] == 'BULLISH')
+            bearish_diamond = sum(s[1] for s in diamond_signals if s[0] == 'BEARISH')
+            diamond_count = len(diamond_signals)
+            if bullish_diamond > bearish_diamond:
+                diamond_score = 50 + min(50, (bullish_diamond - bearish_diamond) / diamond_count)
+            else:
+                diamond_score = 50 - min(50, (bearish_diamond - bullish_diamond) / diamond_count)
+
         # Calculate weighted final score
         weights = {
-            'regime': 0.20,      # 20% (reduced to make room for spike)
-            'xgboost': 0.15,     # 15% (if trained)
-            'volatility': 0.10,  # 10%
-            'oi_trap': 0.15,     # 15%
-            'cvd': 0.10,         # 10%
-            'liquidity': 0.10,   # 10%
+            'regime': 0.15,      # 15% - Market Regime
+            'xgboost': 0.10,     # 10% (if trained)
+            'volatility': 0.08,  # 8%
+            'oi_trap': 0.12,     # 12%
+            'cvd': 0.08,         # 8%
+            'liquidity': 0.07,   # 7%
             'institutional': 0.05,  # 5%
-            'spike': 0.15        # 15% - NEW spike detection weight
+            'spike': 0.10,       # 10% - Spike detection
+            # DIAMOND LEVEL FEATURES (25% total - highest quality signals)
+            'cvd_diamond': 0.07,   # 7% - Cumulative Delta Order Flow
+            'gamma_flip': 0.08,    # 8% - Gamma Wall Flip (critical for volatility)
+            'black_order': 0.05,   # 5% - Hidden Orders
+            'block_trade': 0.05    # 5% - Block Trades
         }
 
         # Adjust weights if XGBoost not trained
         if not (self.xgboost_analyzer and getattr(self.xgboost_analyzer, 'is_trained', False)):
             weights['xgboost'] = 0
-            weights['regime'] = 0.25
-            weights['oi_trap'] = 0.20
-            weights['cvd'] = 0.15
-            weights['spike'] = 0.20  # Increase spike weight when XGBoost not available
+            weights['regime'] = 0.18
+            weights['oi_trap'] = 0.15
+            weights['cvd'] = 0.10
+            weights['spike'] = 0.12
+            # Boost Diamond features when XGBoost unavailable
+            weights['gamma_flip'] = 0.10
+            weights['cvd_diamond'] = 0.10
 
         # If high probability spike detected, boost spike weight significantly
         if spike_detected and spike_probability > 60:
-            weights['spike'] = 0.30  # 30% weight for strong spikes
-            weights['regime'] = 0.15  # Reduce regime weight
+            weights['spike'] = 0.25  # 25% weight for strong spikes
+            weights['regime'] = 0.10  # Reduce regime weight
+
+        # If Diamond features show strong consensus, boost their weight
+        if len(diamond_signals) >= 3:
+            diamond_agreement = all(s[0] == diamond_signals[0][0] for s in diamond_signals)
+            if diamond_agreement:
+                weights['gamma_flip'] = 0.12
+                weights['cvd_diamond'] = 0.10
+                weights['block_trade'] = 0.08
 
         # Normalize weights
         total_weight = sum(weights.values())
@@ -705,6 +1424,36 @@ class UnifiedMLSignalGenerator:
         except Exception as e:
             logger.debug(f"Could not fetch ATM LTP: {e}")
 
+        # ========== RECORD SIGNAL FOR ML TRAINING ==========
+        # Record BUY/SELL signals for real ML training
+        if ML_REAL_TRAINING_AVAILABLE and signal in ['BUY', 'SELL', 'STRONG BUY', 'STRONG SELL']:
+            try:
+                signal_id = record_trading_signal(
+                    signal_type='BUY' if 'BUY' in signal else 'SELL',
+                    confidence=confidence,
+                    atm_strike=atm_strike_val,
+                    entry_price=spot_price or 0
+                )
+                if signal_id:
+                    st.session_state['last_recorded_signal_id'] = signal_id
+                    logger.info(f"Recorded signal for ML training: {signal_id}")
+            except Exception as e:
+                logger.debug(f"Could not record signal: {e}")
+
+        # ========== CHECK SMART ALERTS ==========
+        # Check and send alerts for significant market conditions
+        if SMART_ALERTS_AVAILABLE:
+            try:
+                # Only check alerts on strong signals or periodically
+                should_check = signal in ['STRONG BUY', 'STRONG SELL'] or confidence > 70
+                if should_check:
+                    alert_result = check_and_send_alerts()
+                    if alert_result and alert_result.get('sent', 0) > 0:
+                        st.session_state['last_alert_result'] = alert_result
+                        logger.info(f"Sent {alert_result['sent']} smart alerts")
+            except Exception as e:
+                logger.debug(f"Smart alert check failed: {e}")
+
         return UnifiedSignal(
             signal=signal,
             confidence=confidence,
@@ -820,6 +1569,94 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
         st.caption("💡 Visit NIFTY Option Screener tab to activate spike detection")
 
     # ═══════════════════════════════════════════════════════════════════
+    # 🎯 STOP-LOSS HUNT DETECTOR
+    # ═══════════════════════════════════════════════════════════════════
+    sl_hunt_result = st.session_state.get('sl_hunt_result')
+    if sl_hunt_result and SLHuntResult is not None:
+        hunt_prob = sl_hunt_result.hunt_probability
+        hunt_likely = sl_hunt_result.hunt_likely
+        hunt_dir = sl_hunt_result.hunt_direction
+
+        # Color based on hunt probability
+        if hunt_prob >= 80:
+            hunt_color = "#ff0000"  # Red - HIGH RISK
+            hunt_emoji = "🚨"
+        elif hunt_prob >= 65:
+            hunt_color = "#ff8800"  # Orange - MODERATE RISK
+            hunt_emoji = "⚠️"
+        elif hunt_prob >= 40:
+            hunt_color = "#ffcc00"  # Yellow - LOW RISK
+            hunt_emoji = "🔔"
+        else:
+            hunt_color = "#00cc00"  # Green - SAFE
+            hunt_emoji = "✅"
+
+        # Direction indicator
+        dir_emoji = "⬆️" if hunt_dir == "UP" else "⬇️" if hunt_dir == "DOWN" else "↔️"
+
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, {hunt_color}15, {hunt_color}30);
+                    border: 2px solid {hunt_color};
+                    border-radius: 10px;
+                    padding: 12px 18px;
+                    margin-bottom: 15px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <span style="color: {hunt_color}; font-weight: 800; font-size: 1.1rem;">
+                        {hunt_emoji} SL HUNT DETECTOR
+                    </span>
+                    <span style="color: #aaa; margin-left: 10px;">
+                        {dir_emoji} {hunt_dir}
+                    </span>
+                </div>
+                <div style="text-align: right;">
+                    <span style="color: {hunt_color}; font-size: 1.4rem; font-weight: 900;">
+                        {hunt_prob:.0f}%
+                    </span>
+                </div>
+            </div>
+            <div style="margin-top: 8px; font-size: 0.85rem; color: #bbb;">
+                <span style="margin-right: 10px;">📊 OI: {sl_hunt_result.oi_absorption_score:.0f}%</span>
+                <span style="margin-right: 10px;">📉 Depth: {sl_hunt_result.depth_spoof_score:.0f}%</span>
+                <span style="margin-right: 10px;">⚡ Effort: {sl_hunt_result.effort_result_score:.0f}%</span>
+                <span style="margin-right: 10px;">🎯 SL: {sl_hunt_result.sl_cluster_score:.0f}%</span>
+                <span>⏰ Time: {sl_hunt_result.time_risk_score:.0f}%</span>
+            </div>
+            <div style="margin-top: 5px; font-size: 0.9rem; color: {hunt_color}; font-weight: 600;">
+                {sl_hunt_result.action}: {sl_hunt_result.reason[:80]}{'...' if len(sl_hunt_result.reason) > 80 else ''}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Show trap zones if hunt is likely
+        if hunt_likely and sl_hunt_result.trap_zones:
+            with st.expander("🎯 View Trap Zones & Post-Hunt Setup", expanded=False):
+                # Trap zones
+                st.markdown("**Top SL Trap Zones:**")
+                for i, zone in enumerate(sl_hunt_result.trap_zones[:5], 1):
+                    zone_emoji = "🔴" if zone.zone_type == "PUT_SL_ZONE" else "🟢"
+                    st.markdown(f"  {i}. {zone_emoji} **₹{zone.price:,.0f}** - {zone.zone_type.replace('_', ' ')} ({zone.sl_density:.0f}% density)")
+                    st.caption(f"     {zone.reason}")
+
+                # Post-hunt entry setup
+                if sl_hunt_result.post_hunt_entry:
+                    entry = sl_hunt_result.post_hunt_entry
+                    st.markdown("---")
+                    st.markdown("**📈 Post-Hunt Trade Setup:**")
+                    st.markdown(f"- **Direction:** {entry.get('direction', 'WAIT')}")
+                    st.markdown(f"- **Wait For:** {entry.get('wait_for', 'Hunt completion')}")
+                    st.markdown(f"- **Entry Trigger:** {entry.get('entry_trigger', 'Confirmation candle')}")
+                    st.markdown(f"- **Stop Loss:** {entry.get('sl', 'Hunt candle extreme')}")
+                    st.markdown(f"- **Target:** {entry.get('target', 'Opposite OI wall')}")
+    else:
+        # Run SL Hunt analysis if we have spot price
+        if spot_price and spot_price > 0 and SLHuntDetector is not None:
+            # Auto-analyze on first load
+            if 'sl_hunt_analyzed' not in st.session_state:
+                analyze_sl_hunt(spot_price, auto_send=True)
+                st.session_state['sl_hunt_analyzed'] = True
+
+    # ═══════════════════════════════════════════════════════════════════
     # 📊 ML MARKET REGIME ASSESSMENT
     # ═══════════════════════════════════════════════════════════════════
     # Always show regime info using signal data
@@ -916,6 +1753,113 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
         'Round': 30,         # Psychological only
     }
 
+    # ═══════════════════════════════════════════════════════════════════
+    # STRIKE PCR-BASED DYNAMIC S/R WIDTH CALCULATION
+    # PCR at Strike = PUT OI / CALL OI at that specific strike
+    # Higher PCR at support = Stronger support = Entry zone above strike
+    # Lower PCR at resistance = Stronger resistance = Entry zone below strike
+    # ═══════════════════════════════════════════════════════════════════
+
+    def get_strike_pcr(strike_price: float, df) -> float:
+        """Calculate PCR at a specific strike from merged_df"""
+        if df is None or len(df) == 0:
+            return 1.0
+        try:
+            strike_row = df[df['strikePrice'] == strike_price]
+            if len(strike_row) > 0:
+                put_oi = float(strike_row['OI_PE'].iloc[0]) if 'OI_PE' in strike_row.columns else 0
+                call_oi = float(strike_row['OI_CE'].iloc[0]) if 'OI_CE' in strike_row.columns else 0
+                if call_oi > 0:
+                    return round(put_oi / call_oi, 2)
+        except Exception:
+            pass
+        return 1.0
+
+    def get_support_entry_zone(strike_price: float, strike_pcr: float) -> dict:
+        """
+        Calculate dynamic support entry zone based on strike PCR.
+        Higher PCR = Stronger PUT wall = Entry zone above strike (reverses quickly)
+        Lower PCR = Weaker support = Entry zone below strike (may dip before reversing)
+
+        Returns: {'entry_from': X, 'entry_to': Y, 'strength': 'STRONG'/'MEDIUM'/'WEAK'}
+        """
+        if strike_pcr >= 3.0:
+            # Very strong support - reverses at or above strike
+            return {
+                'entry_from': strike_price,
+                'entry_to': strike_price + 20,
+                'strength': 'STRONG',
+                'buffer': '+20'
+            }
+        elif strike_pcr >= 2.0:
+            # Strong support - may dip 10 points
+            return {
+                'entry_from': strike_price - 10,
+                'entry_to': strike_price + 10,
+                'strength': 'STRONG',
+                'buffer': '±10'
+            }
+        elif strike_pcr >= 1.5:
+            # Medium support - may dip 15 points
+            return {
+                'entry_from': strike_price - 15,
+                'entry_to': strike_price + 5,
+                'strength': 'MEDIUM',
+                'buffer': '-15/+5'
+            }
+        else:
+            # Weak support - may dip 20+ points
+            return {
+                'entry_from': strike_price - 20,
+                'entry_to': strike_price,
+                'strength': 'WEAK',
+                'buffer': '-20'
+            }
+
+    def get_resistance_entry_zone(strike_price: float, strike_pcr: float) -> dict:
+        """
+        Calculate dynamic resistance entry zone based on strike PCR.
+        Lower PCR = Stronger CALL wall = Entry zone below strike (reverses quickly)
+        Higher PCR = Weaker resistance = Entry zone above strike (may push before reversing)
+
+        Returns: {'entry_from': X, 'entry_to': Y, 'strength': 'STRONG'/'MEDIUM'/'WEAK'}
+        """
+        if strike_pcr <= 0.4:
+            # Very strong resistance - reverses at or below strike
+            return {
+                'entry_from': strike_price - 20,
+                'entry_to': strike_price,
+                'strength': 'STRONG',
+                'buffer': '-20'
+            }
+        elif strike_pcr <= 0.5:
+            # Strong resistance - may push 10 points
+            return {
+                'entry_from': strike_price - 10,
+                'entry_to': strike_price + 10,
+                'strength': 'STRONG',
+                'buffer': '±10'
+            }
+        elif strike_pcr <= 0.7:
+            # Medium resistance - may push 15 points
+            return {
+                'entry_from': strike_price - 5,
+                'entry_to': strike_price + 15,
+                'strength': 'MEDIUM',
+                'buffer': '-5/+15'
+            }
+        else:
+            # Weak resistance - may push 20+ points
+            return {
+                'entry_from': strike_price,
+                'entry_to': strike_price + 20,
+                'strength': 'WEAK',
+                'buffer': '+20'
+            }
+
+    # Get merged_df once for strike PCR calculations
+    merged_df_for_pcr = st.session_state.get('merged_df')
+
     exact_supports = []      # List of {'price': X, 'source': 'OI-Wall', 'label': 'PUT OI Wall'}
     exact_resistances = []   # List of {'price': X, 'source': 'Fib-0.618', 'label': '61.8% Fib'}
 
@@ -934,11 +1878,17 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
         supp_strike = supp_data.get('strike') if isinstance(supp_data, dict) else None
         if supp_strike and isinstance(supp_strike, (int, float)) and not isinstance(supp_strike, bool) and supp_strike < spot_price:
             oi_val = supp_data.get('oi', 0) if isinstance(supp_data.get('oi'), (int, float)) else 0
+            # Calculate strike PCR and entry zone
+            strike_pcr = get_strike_pcr(float(supp_strike), merged_df_for_pcr)
+            entry_zone = get_support_entry_zone(float(supp_strike), strike_pcr)
+            strength_icon = "🟢" if entry_zone['strength'] == 'STRONG' else "🟡" if entry_zone['strength'] == 'MEDIUM' else "🔴"
             exact_supports.append({
                 'price': float(supp_strike),
                 'source': 'OI-Wall',
-                'label': f"PUT OI Wall ({oi_val/100000:.1f}L)" if oi_val else "PUT OI Wall",
-                'priority': SOURCE_PRIORITY['OI-Wall']
+                'label': f"PUT OI Wall ({oi_val/100000:.1f}L) PCR:{strike_pcr} {strength_icon}" if oi_val else f"PUT OI Wall PCR:{strike_pcr} {strength_icon}",
+                'priority': SOURCE_PRIORITY['OI-Wall'],
+                'strike_pcr': strike_pcr,
+                'entry_zone': entry_zone
             })
             put_oi_wall_added = True
 
@@ -947,11 +1897,17 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
         res_strike = res_data.get('strike') if isinstance(res_data, dict) else None
         if res_strike and isinstance(res_strike, (int, float)) and not isinstance(res_strike, bool) and res_strike > spot_price:
             oi_val = res_data.get('oi', 0) if isinstance(res_data.get('oi'), (int, float)) else 0
+            # Calculate strike PCR and entry zone
+            strike_pcr = get_strike_pcr(float(res_strike), merged_df_for_pcr)
+            entry_zone = get_resistance_entry_zone(float(res_strike), strike_pcr)
+            strength_icon = "🟢" if entry_zone['strength'] == 'STRONG' else "🟡" if entry_zone['strength'] == 'MEDIUM' else "🔴"
             exact_resistances.append({
                 'price': float(res_strike),
                 'source': 'OI-Wall',
-                'label': f"CALL OI Wall ({oi_val/100000:.1f}L)" if oi_val else "CALL OI Wall",
-                'priority': SOURCE_PRIORITY['OI-Wall']
+                'label': f"CALL OI Wall ({oi_val/100000:.1f}L) PCR:{strike_pcr} {strength_icon}" if oi_val else f"CALL OI Wall PCR:{strike_pcr} {strength_icon}",
+                'priority': SOURCE_PRIORITY['OI-Wall'],
+                'strike_pcr': strike_pcr,
+                'entry_zone': entry_zone
             })
             call_oi_wall_added = True
 
@@ -983,11 +1939,17 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
             max_put_strike = oi_pcr_metrics.get('max_put_strike')
             max_put_oi = oi_pcr_metrics.get('max_put_oi', 0)
             if max_put_strike and isinstance(max_put_strike, (int, float)) and not isinstance(max_put_strike, bool) and max_put_strike < spot_price:
+                # Calculate strike PCR and entry zone
+                strike_pcr = get_strike_pcr(float(max_put_strike), merged_df_for_pcr)
+                entry_zone = get_support_entry_zone(float(max_put_strike), strike_pcr)
+                strength_icon = "🟢" if entry_zone['strength'] == 'STRONG' else "🟡" if entry_zone['strength'] == 'MEDIUM' else "🔴"
                 exact_supports.append({
                     'price': float(max_put_strike),
                     'source': 'OI-Wall',
-                    'label': f"PUT OI Wall ({max_put_oi/100000:.1f}L)" if max_put_oi else "PUT OI Wall",
-                    'priority': SOURCE_PRIORITY['OI-Wall']
+                    'label': f"PUT OI Wall ({max_put_oi/100000:.1f}L) PCR:{strike_pcr} {strength_icon}" if max_put_oi else f"PUT OI Wall PCR:{strike_pcr} {strength_icon}",
+                    'priority': SOURCE_PRIORITY['OI-Wall'],
+                    'strike_pcr': strike_pcr,
+                    'entry_zone': entry_zone
                 })
                 put_oi_wall_added = True
 
@@ -996,11 +1958,17 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
             max_call_strike = oi_pcr_metrics.get('max_call_strike')
             max_call_oi = oi_pcr_metrics.get('max_call_oi', 0)
             if max_call_strike and isinstance(max_call_strike, (int, float)) and not isinstance(max_call_strike, bool) and max_call_strike > spot_price:
+                # Calculate strike PCR and entry zone
+                strike_pcr = get_strike_pcr(float(max_call_strike), merged_df_for_pcr)
+                entry_zone = get_resistance_entry_zone(float(max_call_strike), strike_pcr)
+                strength_icon = "🟢" if entry_zone['strength'] == 'STRONG' else "🟡" if entry_zone['strength'] == 'MEDIUM' else "🔴"
                 exact_resistances.append({
                     'price': float(max_call_strike),
                     'source': 'OI-Wall',
-                    'label': f"CALL OI Wall ({max_call_oi/100000:.1f}L)" if max_call_oi else "CALL OI Wall",
-                    'priority': SOURCE_PRIORITY['OI-Wall']
+                    'label': f"CALL OI Wall ({max_call_oi/100000:.1f}L) PCR:{strike_pcr} {strength_icon}" if max_call_oi else f"CALL OI Wall PCR:{strike_pcr} {strength_icon}",
+                    'priority': SOURCE_PRIORITY['OI-Wall'],
+                    'strike_pcr': strike_pcr,
+                    'entry_zone': entry_zone
                 })
                 call_oi_wall_added = True
 
@@ -1016,11 +1984,18 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
                         max_put_idx = below_spot['OI_PE'].idxmax()
                         max_put_strike = float(below_spot.loc[max_put_idx, 'strikePrice'])
                         max_put_oi = float(below_spot.loc[max_put_idx, 'OI_PE'])
+                        # Calculate strike PCR directly from merged_df row
+                        max_put_call_oi = float(below_spot.loc[max_put_idx, 'OI_CE']) if 'OI_CE' in below_spot.columns else 0
+                        strike_pcr = round(max_put_oi / max_put_call_oi, 2) if max_put_call_oi > 0 else 1.0
+                        entry_zone = get_support_entry_zone(max_put_strike, strike_pcr)
+                        strength_icon = "🟢" if entry_zone['strength'] == 'STRONG' else "🟡" if entry_zone['strength'] == 'MEDIUM' else "🔴"
                         exact_supports.append({
                             'price': max_put_strike,
                             'source': 'OI-Wall',
-                            'label': f"PUT OI Wall ({max_put_oi/100000:.1f}L)",
-                            'priority': SOURCE_PRIORITY['OI-Wall']
+                            'label': f"PUT OI Wall ({max_put_oi/100000:.1f}L) PCR:{strike_pcr} {strength_icon}",
+                            'priority': SOURCE_PRIORITY['OI-Wall'],
+                            'strike_pcr': strike_pcr,
+                            'entry_zone': entry_zone
                         })
                         put_oi_wall_added = True
 
@@ -1031,11 +2006,18 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
                         max_call_idx = above_spot['OI_CE'].idxmax()
                         max_call_strike = float(above_spot.loc[max_call_idx, 'strikePrice'])
                         max_call_oi = float(above_spot.loc[max_call_idx, 'OI_CE'])
+                        # Calculate strike PCR directly from merged_df row
+                        max_call_put_oi = float(above_spot.loc[max_call_idx, 'OI_PE']) if 'OI_PE' in above_spot.columns else 0
+                        strike_pcr = round(max_call_put_oi / max_call_oi, 2) if max_call_oi > 0 else 1.0
+                        entry_zone = get_resistance_entry_zone(max_call_strike, strike_pcr)
+                        strength_icon = "🟢" if entry_zone['strength'] == 'STRONG' else "🟡" if entry_zone['strength'] == 'MEDIUM' else "🔴"
                         exact_resistances.append({
                             'price': max_call_strike,
                             'source': 'OI-Wall',
-                            'label': f"CALL OI Wall ({max_call_oi/100000:.1f}L)",
-                            'priority': SOURCE_PRIORITY['OI-Wall']
+                            'label': f"CALL OI Wall ({max_call_oi/100000:.1f}L) PCR:{strike_pcr} {strength_icon}",
+                            'priority': SOURCE_PRIORITY['OI-Wall'],
+                            'strike_pcr': strike_pcr,
+                            'entry_zone': entry_zone
                         })
                         call_oi_wall_added = True
             except Exception as e:
@@ -1061,6 +2043,133 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
                     'label': 'Spike OI Resistance',
                     'priority': SOURCE_PRIORITY['Spike']
                 })
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 1.5 ADVANCED CHART ANALYSIS S/R (Reversal Zones + Price Action)
+    # Uses: Swing Highs/Lows, Reversal Probability Zones, BOS/CHOCH levels
+    # ═══════════════════════════════════════════════════════════════════
+    # Add priority for Advanced Chart sources
+    if 'Reversal' not in SOURCE_PRIORITY:
+        SOURCE_PRIORITY['Reversal'] = 82  # Between Fib 0.618 and Fib 0.382
+    if 'BOS' not in SOURCE_PRIORITY:
+        SOURCE_PRIORITY['BOS'] = 78  # Break of Structure
+    if 'CHOCH' not in SOURCE_PRIORITY:
+        SOURCE_PRIORITY['CHOCH'] = 77  # Change of Character
+
+    # Get reversal zones data from session state (from Advanced Chart Analysis tab)
+    reversal_zones_data = st.session_state.get('reversal_zones_data', {})
+    price_action_data = st.session_state.get('price_action_data', {})
+
+    if reversal_zones_data and reversal_zones_data.get('success') and spot_price:
+        try:
+            zone = reversal_zones_data.get('zone')
+            if zone:
+                # Add percentile target prices as potential reversal levels
+                if zone.is_bullish:
+                    # Bullish - targets are above current price (resistance)
+                    if zone.percentile_50_price and zone.percentile_50_price > spot_price:
+                        exact_resistances.append({
+                            'price': round(zone.percentile_50_price, 2),
+                            'source': 'Reversal',
+                            'label': 'Reversal Target 50%',
+                            'priority': SOURCE_PRIORITY['Reversal']
+                        })
+                    if zone.percentile_75_price and zone.percentile_75_price > spot_price:
+                        exact_resistances.append({
+                            'price': round(zone.percentile_75_price, 2),
+                            'source': 'Reversal',
+                            'label': 'Reversal Target 75%',
+                            'priority': SOURCE_PRIORITY['Reversal'] - 2
+                        })
+                else:
+                    # Bearish - targets are below current price (support)
+                    if zone.percentile_50_price and zone.percentile_50_price < spot_price:
+                        exact_supports.append({
+                            'price': round(zone.percentile_50_price, 2),
+                            'source': 'Reversal',
+                            'label': 'Reversal Target 50%',
+                            'priority': SOURCE_PRIORITY['Reversal']
+                        })
+                    if zone.percentile_75_price and zone.percentile_75_price < spot_price:
+                        exact_supports.append({
+                            'price': round(zone.percentile_75_price, 2),
+                            'source': 'Reversal',
+                            'label': 'Reversal Target 75%',
+                            'priority': SOURCE_PRIORITY['Reversal'] - 2
+                        })
+
+            # Add swing highs/lows from reversal zones
+            swing_highs_rz = reversal_zones_data.get('swing_highs', [])
+            swing_lows_rz = reversal_zones_data.get('swing_lows', [])
+
+            for sh in swing_highs_rz[-3:]:  # Last 3 swing highs
+                sh_price = sh.get('price')
+                if sh_price and isinstance(sh_price, (int, float)) and sh_price > spot_price:
+                    exact_resistances.append({
+                        'price': float(sh_price),
+                        'source': 'HTF',
+                        'label': 'Chart Swing High',
+                        'priority': SOURCE_PRIORITY['HTF']
+                    })
+
+            for sl in swing_lows_rz[-3:]:  # Last 3 swing lows
+                sl_price = sl.get('price')
+                if sl_price and isinstance(sl_price, (int, float)) and sl_price < spot_price:
+                    exact_supports.append({
+                        'price': float(sl_price),
+                        'source': 'HTF',
+                        'label': 'Chart Swing Low',
+                        'priority': SOURCE_PRIORITY['HTF']
+                    })
+        except Exception as e:
+            logger.debug(f"Error processing reversal zones data: {e}")
+
+    # Get BOS/CHOCH structure levels from price action data
+    if price_action_data and price_action_data.get('success') and spot_price:
+        try:
+            # BOS (Break of Structure) levels
+            bos_events = price_action_data.get('bos_events', [])
+            for bos in bos_events[-5:]:  # Last 5 BOS events
+                struct_level = bos.get('structure_level')
+                bos_type = bos.get('type', '')
+                if struct_level and isinstance(struct_level, (int, float)):
+                    if bos_type == 'BULLISH' and struct_level > spot_price:
+                        exact_resistances.append({
+                            'price': float(struct_level),
+                            'source': 'BOS',
+                            'label': f'BOS Bullish ↑',
+                            'priority': SOURCE_PRIORITY['BOS']
+                        })
+                    elif bos_type == 'BEARISH' and struct_level < spot_price:
+                        exact_supports.append({
+                            'price': float(struct_level),
+                            'source': 'BOS',
+                            'label': f'BOS Bearish ↓',
+                            'priority': SOURCE_PRIORITY['BOS']
+                        })
+
+            # CHOCH (Change of Character) levels - trend reversals
+            choch_events = price_action_data.get('choch_events', [])
+            for choch in choch_events[-3:]:  # Last 3 CHOCH events
+                struct_level = choch.get('structure_level')
+                choch_type = choch.get('type', '')
+                if struct_level and isinstance(struct_level, (int, float)):
+                    if struct_level > spot_price:
+                        exact_resistances.append({
+                            'price': float(struct_level),
+                            'source': 'CHOCH',
+                            'label': f'CHOCH {choch_type}',
+                            'priority': SOURCE_PRIORITY['CHOCH']
+                        })
+                    elif struct_level < spot_price:
+                        exact_supports.append({
+                            'price': float(struct_level),
+                            'source': 'CHOCH',
+                            'label': f'CHOCH {choch_type}',
+                            'priority': SOURCE_PRIORITY['CHOCH']
+                        })
+        except Exception as e:
+            logger.debug(f"Error processing price action data: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
     # 2. FIBONACCI LEVELS (Price Action Based)
@@ -1156,6 +2265,8 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
                     # 15min chart with 40 bars = ~10 hours (daily range)
 
                     periods = {
+                        '5min': 2,     # 2 bars = 30 min lookback (short-term)
+                        '10min': 3,    # 3 bars = 45 min lookback
                         '15min': 5,    # 5 bars = 1.25 hours lookback
                         '1H': 10,      # 10 bars = 2.5 hours lookback
                         '4H': 20,      # 20 bars = 5 hours lookback
@@ -1276,36 +2387,173 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
                 })
 
     # ═══════════════════════════════════════════════════════════════════
-    # 7. CONFLUENCE DETECTION (HTF + Fib alignment = Strongest levels)
-    # If HTF pivot aligns with Fib level within 20 points, mark as confluence
+    # 7. EXACT REVERSAL DETECTION (OI Wall Entry Zone + Fib + HTF Confluence)
+    # Combines: OI Wall PCR-based entry zone + Fibonacci levels + HTF pivots
+    # When multiple factors align = HIGH PROBABILITY EXACT REVERSAL POINT
     # ═══════════════════════════════════════════════════════════════════
     CONFLUENCE_TOLERANCE = 20  # Points within which levels are considered aligned
 
-    def find_confluence(levels):
-        """Find and mark confluence levels (HTF + Fib aligned)"""
+    def find_exact_reversal_zones(levels, is_support=True):
+        """
+        Find EXACT REVERSAL zones by combining:
+        1. OI Wall with PCR-based entry zone
+        2. Fibonacci levels within entry zone
+        3. HTF pivots (5min/10min/15min) within entry zone
+        4. BOS/CHOCH structure levels within entry zone
+        5. Reversal Probability Zones targets within entry zone
+
+        Returns enhanced levels with reversal probability score
+        """
         if not levels or len(levels) < 2:
             return levels
 
         # Separate by source type
+        oi_walls = [l for l in levels if l['source'] == 'OI-Wall' and l.get('entry_zone')]
         htf_levels = [l for l in levels if l['source'] == 'HTF']
         fib_levels = [l for l in levels if 'Fib' in l['source']]
-        other_levels = [l for l in levels if l['source'] != 'HTF' and 'Fib' not in l['source']]
+        bos_levels = [l for l in levels if l['source'] == 'BOS']
+        choch_levels = [l for l in levels if l['source'] == 'CHOCH']
+        reversal_levels = [l for l in levels if l['source'] == 'Reversal']
+        other_levels = [l for l in levels if l['source'] not in ['OI-Wall', 'HTF', 'BOS', 'CHOCH', 'Reversal'] and 'Fib' not in l['source']]
 
-        # Check for HTF + Fib confluence
-        confluence_found = []
+        # For each OI Wall, find confluent levels within its entry zone
+        enhanced_oi_walls = []
         used_htf = set()
         used_fib = set()
+        used_bos = set()
+        used_choch = set()
+        used_reversal = set()
 
-        for i, htf in enumerate(htf_levels):
+        for oi in oi_walls:
+            entry_zone = oi.get('entry_zone', {})
+            zone_from = entry_zone.get('entry_from', oi['price'] - 20)
+            zone_to = entry_zone.get('entry_to', oi['price'] + 20)
+            strike_pcr = oi.get('strike_pcr', 1.0)
+
+            # Find HTF pivots within OI Wall entry zone
+            htf_in_zone = []
+            for i, htf in enumerate(htf_levels):
+                if i not in used_htf and zone_from <= htf['price'] <= zone_to:
+                    htf_in_zone.append(htf)
+                    used_htf.add(i)
+
+            # Find Fib levels within OI Wall entry zone
+            fib_in_zone = []
             for j, fib in enumerate(fib_levels):
+                if j not in used_fib and zone_from <= fib['price'] <= zone_to:
+                    fib_in_zone.append(fib)
+                    used_fib.add(j)
+
+            # Find BOS levels within OI Wall entry zone
+            bos_in_zone = []
+            for k, bos in enumerate(bos_levels):
+                if k not in used_bos and zone_from <= bos['price'] <= zone_to:
+                    bos_in_zone.append(bos)
+                    used_bos.add(k)
+
+            # Find CHOCH levels within OI Wall entry zone
+            choch_in_zone = []
+            for m, choch in enumerate(choch_levels):
+                if m not in used_choch and zone_from <= choch['price'] <= zone_to:
+                    choch_in_zone.append(choch)
+                    used_choch.add(m)
+
+            # Find Reversal targets within OI Wall entry zone
+            reversal_in_zone = []
+            for n, rev in enumerate(reversal_levels):
+                if n not in used_reversal and zone_from <= rev['price'] <= zone_to:
+                    reversal_in_zone.append(rev)
+                    used_reversal.add(n)
+
+            # Calculate REVERSAL PROBABILITY based on confluence
+            # Base score from PCR strength
+            strength = entry_zone.get('strength', 'MEDIUM')
+            if strength == 'STRONG':
+                base_score = 70
+            elif strength == 'MEDIUM':
+                base_score = 50
+            else:
+                base_score = 30
+
+            # Add points for each confluent factor
+            htf_bonus = len(htf_in_zone) * 10  # +10 per HTF pivot in zone
+            fib_bonus = len(fib_in_zone) * 8   # +8 per Fib level in zone
+            bos_bonus = len(bos_in_zone) * 7   # +7 per BOS level in zone
+            choch_bonus = len(choch_in_zone) * 6  # +6 per CHOCH level in zone
+            reversal_bonus = len(reversal_in_zone) * 5  # +5 per Reversal target in zone
+
+            # Extra bonus for key Fib levels (0.618, 0.382)
+            key_fib_bonus = sum(5 for f in fib_in_zone if '0.618' in f.get('label', '') or '0.382' in f.get('label', ''))
+
+            # Calculate total reversal probability
+            reversal_probability = min(99, base_score + htf_bonus + fib_bonus + bos_bonus + choch_bonus + reversal_bonus + key_fib_bonus)
+
+            # Determine exact reversal price (average of ALL confluent levels)
+            confluent_prices = [oi['price']]
+            confluent_prices.extend([h['price'] for h in htf_in_zone])
+            confluent_prices.extend([f['price'] for f in fib_in_zone])
+            confluent_prices.extend([b['price'] for b in bos_in_zone])
+            confluent_prices.extend([c['price'] for c in choch_in_zone])
+            confluent_prices.extend([r['price'] for r in reversal_in_zone])
+            exact_reversal_price = round(sum(confluent_prices) / len(confluent_prices), 2)
+
+            # Build confluence label
+            confluence_parts = []
+            if htf_in_zone:
+                htf_names = [h['label'].split()[0] for h in htf_in_zone]  # Get timeframe names
+                confluence_parts.append(f"HTF:{'+'.join(htf_names)}")
+            if fib_in_zone:
+                fib_names = [f['label'].split('%')[0] + '%' for f in fib_in_zone]
+                confluence_parts.append(f"Fib:{'+'.join(fib_names)}")
+            if bos_in_zone:
+                confluence_parts.append(f"BOS:{len(bos_in_zone)}")
+            if choch_in_zone:
+                confluence_parts.append(f"CHOCH:{len(choch_in_zone)}")
+            if reversal_in_zone:
+                confluence_parts.append(f"RevZone:{len(reversal_in_zone)}")
+
+            # Create enhanced OI Wall entry
+            enhanced_entry = {
+                'price': oi['price'],
+                'source': 'OI-Wall',
+                'label': oi['label'],
+                'priority': SOURCE_PRIORITY['OI-Wall'],
+                'strike_pcr': strike_pcr,
+                'entry_zone': entry_zone,
+                'reversal_probability': reversal_probability,
+                'exact_reversal_price': exact_reversal_price,
+                'confluent_htf': [h['label'] for h in htf_in_zone],
+                'confluent_fib': [f['label'] for f in fib_in_zone],
+                'confluent_bos': [b['label'] for b in bos_in_zone],
+                'confluent_choch': [c['label'] for c in choch_in_zone],
+                'confluent_reversal': [r['label'] for r in reversal_in_zone],
+            }
+
+            # If high confluence, mark as EXACT REVERSAL ZONE
+            if reversal_probability >= 75:
+                enhanced_entry['is_exact_reversal'] = True
+                enhanced_entry['label'] = f"{oi['label']} 🎯 REVERSAL {reversal_probability}%"
+                if confluence_parts:
+                    enhanced_entry['confluence_detail'] = ' + '.join(confluence_parts)
+
+            enhanced_oi_walls.append(enhanced_entry)
+
+        # Also check for HTF + Fib confluence (without OI Wall)
+        confluence_found = []
+        for i, htf in enumerate(htf_levels):
+            if i in used_htf:
+                continue
+            for j, fib in enumerate(fib_levels):
+                if j in used_fib:
+                    continue
                 if abs(htf['price'] - fib['price']) <= CONFLUENCE_TOLERANCE:
-                    # Confluence found! Create merged level with boosted priority
                     avg_price = (htf['price'] + fib['price']) / 2
                     confluence_found.append({
                         'price': round(avg_price, 2),
                         'source': 'Confluence',
                         'label': f"HTF+{fib['label']} ⚡",
-                        'priority': 95  # Very high priority (just below OI Wall)
+                        'priority': 95,
+                        'reversal_probability': 65  # Lower than OI Wall confluence
                     })
                     used_htf.add(i)
                     used_fib.add(j)
@@ -1313,12 +2561,19 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
         # Keep non-confluence levels
         remaining_htf = [l for i, l in enumerate(htf_levels) if i not in used_htf]
         remaining_fib = [l for j, l in enumerate(fib_levels) if j not in used_fib]
+        remaining_bos = [l for k, l in enumerate(bos_levels) if k not in used_bos]
+        remaining_choch = [l for m, l in enumerate(choch_levels) if m not in used_choch]
+        remaining_reversal = [l for n, l in enumerate(reversal_levels) if n not in used_reversal]
 
-        return confluence_found + remaining_htf + remaining_fib + other_levels
+        # OI Walls without entry_zone (legacy)
+        legacy_oi_walls = [l for l in levels if l['source'] == 'OI-Wall' and not l.get('entry_zone')]
 
-    # Apply confluence detection
-    exact_supports = find_confluence(exact_supports)
-    exact_resistances = find_confluence(exact_resistances)
+        return (enhanced_oi_walls + legacy_oi_walls + confluence_found +
+                remaining_htf + remaining_fib + remaining_bos + remaining_choch + remaining_reversal + other_levels)
+
+    # Apply EXACT REVERSAL detection
+    exact_supports = find_exact_reversal_zones(exact_supports, is_support=True)
+    exact_resistances = find_exact_reversal_zones(exact_resistances, is_support=False)
 
     # Add Confluence to priority if not exists
     if 'Confluence' not in SOURCE_PRIORITY:
@@ -1391,6 +2646,22 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
     # Get primary S/R for display
     support = merged_supports[0]['price'] if merged_supports else 0
     resistance = merged_resistances[0]['price'] if merged_resistances else 0
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 🎯 AUTO ENTRY SIGNAL - Check if price in exact reversal zone
+    # Send Telegram alert when price enters high-probability reversal zone
+    # ═══════════════════════════════════════════════════════════════════
+    auto_entry_enabled = st.session_state.get('auto_entry_telegram', True)
+    if spot_price and auto_entry_enabled:
+        triggered_entries = check_and_send_reversal_entry(
+            spot_price=spot_price,
+            support_levels=merged_supports,
+            resistance_levels=merged_resistances,
+            auto_send=True
+        )
+        # Store triggered entries for display
+        if triggered_entries:
+            st.session_state['last_triggered_entries'] = triggered_entries
 
     # Build signals text
     signals_text = ""
@@ -1475,6 +2746,86 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
                     st.write(f"• {sig}")
 
     # ═══════════════════════════════════════════════════════════════════
+    # 🎯 AUTO ENTRY TELEGRAM SETTINGS
+    # ═══════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    entry_col1, entry_col2 = st.columns([2, 1])
+    with entry_col1:
+        st.subheader("🎯 Exact Reversal Entry Signals")
+    with entry_col2:
+        auto_entry = st.checkbox("📱 Auto Telegram Entry", value=True, key="auto_entry_telegram")
+
+    # Show triggered entry signals with Killer analysis
+    last_entries = st.session_state.get('last_triggered_entries', [])
+    if last_entries:
+        for entry in last_entries:
+            killer_score = entry.get('killer_score', 100)
+            killer_allowed = entry.get('killer_allowed', True)
+
+            if entry.get('success'):
+                st.success(f"✅ Entry Signal Sent: {entry['type']} at ₹{entry['price']:,.0f} | Killer Score: {killer_score:.0f}/100")
+            elif not killer_allowed:
+                # Entry blocked by Expiry Day Killer
+                st.error(f"🛑 BLOCKED BY KILLER: {entry['type']} at ₹{entry['price']:,.0f} | Score: {killer_score:.0f}/100")
+                block_reasons = entry.get('block_reasons', [])
+                if block_reasons:
+                    for reason in block_reasons[:2]:
+                        st.caption(f"   ⚠️ {reason}")
+            else:
+                st.warning(f"⚠️ {entry['type']}: {entry.get('message', 'Not sent')}")
+
+    # Show last Killer analysis result
+    killer_result = st.session_state.get('last_killer_result')
+    if killer_result is not None:
+        with st.expander("🛡️ Expiry Day Killer Analysis", expanded=False):
+            col_k1, col_k2, col_k3 = st.columns(3)
+            with col_k1:
+                risk_color = "green" if killer_result.risk_level == "LOW" else "orange" if killer_result.risk_level == "MEDIUM" else "red"
+                st.metric("Safety Score", f"{killer_result.overall_score:.0f}/100")
+            with col_k2:
+                st.metric("Risk Level", killer_result.risk_level)
+            with col_k3:
+                st.metric("Volume", f"{killer_result.volume_ratio:.1f}x")
+
+            st.markdown("**Filter Results:**")
+            filter_cols = st.columns(5)
+            with filter_cols[0]:
+                st.caption(f"Time: {killer_result.time_filter.value}")
+            with filter_cols[1]:
+                st.caption(f"Volume: {killer_result.volume_filter.value}")
+            with filter_cols[2]:
+                st.caption(f"Retest: {killer_result.retest_filter.value}")
+            with filter_cols[3]:
+                st.caption(f"OI Wall: {killer_result.oi_wall_filter.value}")
+            with filter_cols[4]:
+                st.caption(f"Max Pain: {killer_result.max_pain_filter.value}")
+
+            if killer_result.block_reasons:
+                st.error("Block Reasons: " + " | ".join(killer_result.block_reasons[:2]))
+            if killer_result.warning_reasons:
+                st.warning("Warnings: " + " | ".join(killer_result.warning_reasons[:2]))
+
+    # Show current distance to reversal zones
+    if spot_price:
+        for supp in merged_supports[:2]:
+            if supp.get('is_exact_reversal') and supp.get('entry_zone'):
+                zone = supp['entry_zone']
+                dist = spot_price - zone.get('entry_to', supp['price'])
+                if dist > 0:
+                    st.info(f"📍 SUPPORT Entry Zone: ₹{zone['entry_from']:,.0f} - ₹{zone['entry_to']:,.0f} | Distance: {dist:.0f} pts away")
+                else:
+                    st.success(f"🎯 IN SUPPORT ZONE: ₹{zone['entry_from']:,.0f} - ₹{zone['entry_to']:,.0f} | Reversal: {supp.get('reversal_probability', 0)}%")
+
+        for res in merged_resistances[:2]:
+            if res.get('is_exact_reversal') and res.get('entry_zone'):
+                zone = res['entry_zone']
+                dist = zone.get('entry_from', res['price']) - spot_price
+                if dist > 0:
+                    st.info(f"📍 RESISTANCE Entry Zone: ₹{zone['entry_from']:,.0f} - ₹{zone['entry_to']:,.0f} | Distance: {dist:.0f} pts away")
+                else:
+                    st.error(f"🎯 IN RESISTANCE ZONE: ₹{zone['entry_from']:,.0f} - ₹{zone['entry_to']:,.0f} | Reversal: {res.get('reversal_probability', 0)}%")
+
+    # ═══════════════════════════════════════════════════════════════════
     # 📊 EXACT SUPPORT/RESISTANCE LEVELS - Python Components
     # ═══════════════════════════════════════════════════════════════════
     if merged_supports or merged_resistances:
@@ -1497,7 +2848,31 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
                     else:
                         stars = "★"    # HTF/VWAP/Round
                     label = s.get('label', 'Support')
-                    st.success(f"S{i+1}: ₹{s['price']:,.0f} | {label} {stars}")
+
+                    # Check for EXACT REVERSAL zone
+                    reversal_prob = s.get('reversal_probability', 0)
+                    if s.get('is_exact_reversal') and reversal_prob >= 75:
+                        st.success(f"🎯 S{i+1}: ₹{s['price']:,.0f} | REVERSAL {reversal_prob}% ★★★")
+                        # Show exact reversal price
+                        exact_price = s.get('exact_reversal_price', s['price'])
+                        st.caption(f"   🎯 EXACT REVERSAL: ₹{exact_price:,.0f}")
+                        # Show confluence details
+                        if s.get('confluence_detail'):
+                            st.caption(f"   ⚡ Confluence: {s['confluence_detail']}")
+                    else:
+                        st.success(f"S{i+1}: ₹{s['price']:,.0f} | {label} {stars}")
+
+                    # Show entry zone for OI Wall with PCR
+                    entry_zone = s.get('entry_zone')
+                    if entry_zone and s.get('source') == 'OI-Wall':
+                        st.caption(f"   📍 Entry Zone: ₹{entry_zone['entry_from']:,.0f} - ₹{entry_zone['entry_to']:,.0f} ({entry_zone['buffer']})")
+                        # Show confluent factors if any
+                        htf_list = s.get('confluent_htf', [])
+                        fib_list = s.get('confluent_fib', [])
+                        if htf_list:
+                            st.caption(f"   📊 HTF Pivots: {', '.join(htf_list)}")
+                        if fib_list:
+                            st.caption(f"   📐 Fib Levels: {', '.join(fib_list)}")
             else:
                 st.caption("No support levels detected")
 
@@ -1514,9 +2889,64 @@ def render_unified_signal(signal: UnifiedSignal, spot_price: float = None):
                     else:
                         stars = "★"    # HTF/VWAP/Round
                     label = r.get('label', 'Resistance')
-                    st.error(f"R{i+1}: ₹{r['price']:,.0f} | {label} {stars}")
+
+                    # Check for EXACT REVERSAL zone
+                    reversal_prob = r.get('reversal_probability', 0)
+                    if r.get('is_exact_reversal') and reversal_prob >= 75:
+                        st.error(f"🎯 R{i+1}: ₹{r['price']:,.0f} | REVERSAL {reversal_prob}% ★★★")
+                        # Show exact reversal price
+                        exact_price = r.get('exact_reversal_price', r['price'])
+                        st.caption(f"   🎯 EXACT REVERSAL: ₹{exact_price:,.0f}")
+                        # Show confluence details
+                        if r.get('confluence_detail'):
+                            st.caption(f"   ⚡ Confluence: {r['confluence_detail']}")
+                    else:
+                        st.error(f"R{i+1}: ₹{r['price']:,.0f} | {label} {stars}")
+
+                    # Show entry zone for OI Wall with PCR
+                    entry_zone = r.get('entry_zone')
+                    if entry_zone and r.get('source') == 'OI-Wall':
+                        st.caption(f"   📍 Entry Zone: ₹{entry_zone['entry_from']:,.0f} - ₹{entry_zone['entry_to']:,.0f} ({entry_zone['buffer']})")
+                        # Show confluent factors if any
+                        htf_list = r.get('confluent_htf', [])
+                        fib_list = r.get('confluent_fib', [])
+                        if htf_list:
+                            st.caption(f"   📊 HTF Pivots: {', '.join(htf_list)}")
+                        if fib_list:
+                            st.caption(f"   📐 Fib Levels: {', '.join(fib_list)}")
             else:
                 st.caption("No resistance levels detected")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 📏 PCR-BASED ENTRY ZONE REFERENCE (Show how S/R width changes with PCR)
+        # ═══════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("**📏 PCR-Based Entry Zone Reference**")
+        st.caption("How Support/Resistance zones vary based on Strike PCR")
+
+        pcr_col1, pcr_col2 = st.columns(2)
+
+        with pcr_col1:
+            st.markdown("""
+**🛡️ SUPPORT Entry Zones (PUT OI Wall)**
+| PCR | Strength | Entry Zone |
+|-----|----------|------------|
+| ≥3.0 | 🟢 STRONG | Strike +20 (reverses early) |
+| 2.0-3.0 | 🟢 STRONG | Strike ±10 |
+| 1.5-2.0 | 🟡 MEDIUM | Strike -15 to +5 |
+| <1.5 | 🔴 WEAK | Strike -20 (may dip below) |
+""")
+
+        with pcr_col2:
+            st.markdown("""
+**🧱 RESISTANCE Entry Zones (CALL OI Wall)**
+| PCR | Strength | Entry Zone |
+|-----|----------|------------|
+| ≤0.4 | 🟢 STRONG | Strike -20 (reverses early) |
+| 0.4-0.5 | 🟢 STRONG | Strike ±10 |
+| 0.5-0.7 | 🟡 MEDIUM | Strike -5 to +15 |
+| >0.7 | 🔴 WEAK | Strike +20 (may push above) |
+""")
 
     # ═══════════════════════════════════════════════════════════════════
     # 🎯 FINAL ASSESSMENT - Clear Directional Call
